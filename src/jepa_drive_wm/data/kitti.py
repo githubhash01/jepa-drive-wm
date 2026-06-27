@@ -1,3 +1,5 @@
+from turtle import write
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -142,6 +144,14 @@ class KITTISequence:
 
     def _load_times(self) -> np.ndarray:
         times_path = self.sequence_folder / "times.txt"
+        # check if the file exists
+        if not times_path.exists():
+            # get the number of frames from the image_2 folder
+            image_dir = self.sequence_folder / "image_2"
+            num_frames = len(list(image_dir.glob("*.png")))
+            self.number_frames = num_frames
+            self.duration = num_frames * 0.1  # assuming 10 Hz
+            return np.arange(0, num_frames * 0.1, 0.1)  # default to 10 frames at 10 Hz
         with open(times_path, "r") as f:
             times = [float(line) for line in f if line.strip()]
         self.number_frames = len(times)
@@ -169,6 +179,12 @@ class KITTISequence:
     def _load_gt_poses(self) -> torch.Tensor:
         """Load KITTI poses file -> (N, 4, 4) SE(3) tensor T_w_c0[i] in float64."""
         poses_path = GT_POSES_DIR / f"{self.sequence_nr:02d}.txt"
+
+        # if the poses file does not exist, return identity poses
+        if not poses_path.exists():
+            print(f"Warning: poses file {poses_path} does not exist. Using identity poses.")
+            return torch.eye(4, dtype=torch.float64).unsqueeze(0).repeat(self.number_frames, 1, 1)
+        
         rows = np.loadtxt(poses_path, dtype=np.float64).reshape(-1, 3, 4)   # (N, 3, 4)
 
         T = np.tile(np.eye(4, dtype=np.float64), (rows.shape[0], 1, 1))     # (N, 4, 4)
@@ -229,40 +245,38 @@ class KITTISequence:
 
 
 def main():
-    # seq_10 = KITTISequence(10)
-    # print(f"Sequence 10 has {len(seq_10)} frames, duration {seq_10.duration:.2f} seconds.")
-    # seq_10.calib.sanity_check()
+    seq_10 = KITTISequence(10)
+    print(f"Sequence 10 has {len(seq_10)} frames, duration {seq_10.duration:.2f} seconds.")
+    seq_10.calib.sanity_check()
 
-    # # Identity relative transform must be the identity.
-    # rel = seq_10.relative_left_color_pose(5, 5)
-    # print("relative_left_color_pose(5, 5) ~ I:",
-    #       torch.allclose(rel, torch.eye(4, dtype=torch.float64), atol=1e-9))
+    # Identity relative transform must be the identity.
+    rel = seq_10.relative_left_color_pose(5, 5)
+    print("relative_left_color_pose(5, 5) ~ I:",
+          torch.allclose(rel, torch.eye(4, dtype=torch.float64), atol=1e-9))
 
-    # seq_10.write_foundationstereo_intrinsics()
+    seq_10.write_foundationstereo_intrinsics()
     # write out the intrinsics for all sequences
-    # for seq_nr in range(11):
-    #     if seq_nr == 8:
-    #         continue  # sequence 00 is not in odometry dataset
-    #     seq = KITTISequence(seq_nr)
-    #     seq.write_foundationstereo_intrinsics()
+    for seq_nr in range(22):
+        seq = KITTISequence(seq_nr)
+        seq.write_foundationstereo_intrinsics()
 
     # test loading an image and depth
-    seq_10 = KITTISequence(0)
-    img = seq_10.load_image(0)
-    depth = seq_10.load_depth(0)
-    print(f"Loaded image shape: {img.shape}, depth shape: {depth.shape}")
+    # seq_10 = KITTISequence(0)
+    # img = seq_10.load_image(0)
+    # depth = seq_10.load_depth(0)
+    # print(f"Loaded image shape: {img.shape}, depth shape: {depth.shape}")
 
-    # plot the image and depth
-    plt.figure(figsize=(12, 6))
-    plt.subplot(1, 2, 1)
-    plt.imshow(img)
-    plt.title("Left Color Image (image_2)")
-    plt.axis("off")
-    plt.subplot(1, 2, 2)
-    plt.imshow(depth, cmap="plasma")
-    plt.title("Depth Map")
-    plt.axis("off")
-    plt.show()
+    # # plot the image and depth
+    # plt.figure(figsize=(12, 6))
+    # plt.subplot(1, 2, 1)
+    # plt.imshow(img)
+    # plt.title("Left Color Image (image_2)")
+    # plt.axis("off")
+    # plt.subplot(1, 2, 2)
+    # plt.imshow(depth, cmap="plasma")
+    # plt.title("Depth Map")
+    # plt.axis("off")
+    # plt.show()
 
 if __name__ == "__main__":
     main()
