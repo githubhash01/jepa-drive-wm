@@ -10,6 +10,7 @@ Run:
 """
 from __future__ import annotations
 
+import math
 import os
 from itertools import islice
 
@@ -29,13 +30,23 @@ def _infinite(loader):
         yield from loader
 
 
+def _warmup_cosine(warmup: int, total: int, min_ratio: float = 0.01):
+    """LR multiplier: linear warm-up for ``warmup`` iters, then cosine decay to min_ratio."""
+    def lr_lambda(it: int) -> float:
+        if it < warmup:
+            return (it + 1) / max(warmup, 1)
+        progress = (it - warmup) / max(total - warmup, 1)
+        return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return lr_lambda
+
+
 def build_loaders(cfg: DepthProbeConfig):
     common = dict(
-        embeddings_dir=cfg.embeddings_dir,
         kitti_sequences_dir=cfg.kitti_sequences_dir,
-        embedding_model=cfg.embedding_model,
+        embedding_dirname=cfg.embedding_dirname,
         min_depth=cfg.min_depth,
         max_depth=cfg.max_depth,
+        target_hw=cfg.target_hw,
         ram_cache=cfg.ram_cache,
     )
     train_ds = CachedDepthDataset(cfg.train_sequences, **common)
@@ -53,9 +64,15 @@ def build_loaders(cfg: DepthProbeConfig):
 
 
 def predict_depth(probe: DepthProbe, feat: torch.Tensor, out_hw: tuple[int, int]) -> torch.Tensor:
-    """Run the probe and upsample the (B,1,gh,gw) depth to the GT resolution (B,1,H,W)."""
-    depth = probe(feat)
-    return F.interpolate(depth, size=out_hw, mode="bilinear", align_corners=False)
+    """Run the probe (bf16 autocast on cuda) and upsample depth to the GT resolution (B,1,H,W).
+
+    The decoder's high-res bin logits dominate memory; bf16 halves that and matches the
+    precision the V-JEPA features were encoded at. The loss is computed in fp32 (depth is
+    cast back below) for numerical stability.
+    """
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=feat.is_cuda):
+        depth = probe(feat)
+    return F.interpolate(depth.float(), size=out_hw, mode="bilinear", align_corners=False)
 
 
 @torch.no_grad()
@@ -87,9 +104,10 @@ def train(cfg: DepthProbeConfig | None = None):
     probe = DepthProbe.from_config(cfg).to(device)
     criterion = build_loss(cfg.losses).to(device)
     optim = torch.optim.AdamW(probe.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    sched = torch.optim.lr_scheduler.LambdaLR(optim, _warmup_cosine(cfg.warmup_iters, cfg.total_iters))
 
     n_params = sum(p.numel() for p in probe.parameters() if p.requires_grad)
-    print(f"[train] device={device}  trainable params={n_params:,}  iters={cfg.total_iters}")
+    print(f"[train] device={device}  head={cfg.head_type}  trainable params={n_params:,}  iters={cfg.total_iters}")
 
     best_abs_rel = float("inf")
     probe.train()
@@ -102,9 +120,10 @@ def train(cfg: DepthProbeConfig | None = None):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(probe.parameters(), cfg.grad_clip)
         optim.step()
+        sched.step()
 
         if it % cfg.log_every == 0:
-            print(f"[train] iter {it:>6}/{cfg.total_iters}  loss {loss.item():.4f}")
+            print(f"[train] iter {it:>6}/{cfg.total_iters}  loss {loss.item():.4f}  lr {sched.get_last_lr()[0]:.2e}")
 
         if it % cfg.eval_every == 0 or it == cfg.total_iters:
             metrics = evaluate(probe, val_loader, cfg, device)

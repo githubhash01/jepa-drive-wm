@@ -39,6 +39,10 @@ import torch
 import numpy as np
 from torchvision import transforms
 
+# Hardcoded local paths — keep it simple.
+VJEPA_REPO = "/home/hashim/Modules/vjepa2"
+VJEPA_CHECKPOINTS_DIR = "/home/hashim/Modules/model_checkpoints/vjepa21"
+
 # Import locations inside the V-JEPA2 repo. Kept in one place so a repo
 # re-organisation costs you exactly two lines.
 ENCODER_MODULE = "app.vjepa_2_1.models.vision_transformer"
@@ -140,13 +144,13 @@ class VJEPA21Wrapper:
         self.output_dtype = output_dtype
 
         self.repo_path = Path(
-            repo_path if repo_path is not None else PATHS.VJEPA_REPO
+            repo_path if repo_path is not None else VJEPA_REPO
         ).expanduser().resolve()
 
         self.checkpoint_path = (
             Path(checkpoint_path).expanduser().resolve()
             if checkpoint_path is not None
-            else Path(PATHS.VJEPA_CHECKPOINTS_DIR).expanduser().resolve() / self.size.checkpoint_name
+            else Path(VJEPA_CHECKPOINTS_DIR).expanduser().resolve() / self.size.checkpoint_name
         )
 
         

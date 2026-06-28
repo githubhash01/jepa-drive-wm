@@ -35,11 +35,11 @@ def visualize(ckpt_path: str, index: int = 0, save_path: str | None = None):
     probe.eval()
 
     ds = CachedDepthDataset(
-        cfg.val_sequences, cfg.embeddings_dir, cfg.kitti_sequences_dir,
-        cfg.embedding_model, cfg.min_depth, cfg.max_depth,
+        cfg.val_sequences, cfg.kitti_sequences_dir, cfg.embedding_dirname,
+        cfg.min_depth, cfg.max_depth, cfg.target_hw,
     )
     feat, depth, valid = ds[index]
-    _, depth_path = ds.samples[index]
+    depth_path = ds.samples[index][1]
 
     with torch.no_grad():
         pred = predict_depth(probe, feat[None].to(device), depth.shape[-2:])
