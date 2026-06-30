@@ -73,12 +73,14 @@ class DepthProbeConfig:
     grad_clip: float = 35.0
     batch_size: int = 4                  # conv decoder's high-res bins are memory-heavy on ~8 GB GPUs
     num_workers: int = 4
-    total_iters: int = 8000
+    total_iters: int = 4000
     warmup_iters: int = 200              # linear LR warm-up before cosine decay
     warm_up_loss: bool = True            # SigLoss scale warm-up
 
     # --- eval / logging -----------------------------------------------------
     eval_every: int = 500
+    eval_max_batches: int = 150          # periodic eval samples this many val batches
+                                         # (the final eval at total_iters runs the full set)
     log_every: int = 50
     seed: int = 0
     out_dir: str = "/home/hashim/Desktop/Outputs/vjepa21_depth"
