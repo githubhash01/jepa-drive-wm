@@ -16,7 +16,7 @@ import torch
 from PIL import Image
 
 from .config import DepthProbeConfig
-from .dataset import CachedDepthDataset, load_depth_metres
+from .dataset import CachedDepthDataset, ImageDepthDataset, load_depth_metres
 from .head import DepthProbe
 from .train import predict_depth
 
@@ -34,15 +34,31 @@ def visualize(ckpt_path: str, index: int = 0, save_path: str | None = None):
     probe.load_state_dict(blob["head"])
     probe.eval()
 
-    ds = CachedDepthDataset(
-        cfg.val_sequences, cfg.kitti_sequences_dir, cfg.embedding_dirname,
-        cfg.min_depth, cfg.max_depth, cfg.target_hw,
-    )
-    feat, depth, valid = ds[index]
+    if cfg.feature_mode == "online":
+        h, w = cfg.target_hw
+        ds = ImageDepthDataset(
+            cfg.val_sequences, cfg.kitti_sequences_dir, cfg.image_dirname,
+            cfg.min_depth, cfg.max_depth, cfg.target_hw, image_height=h, image_width=w,
+        )
+        from jepa_drive_wm.utils.vjepa_wrapper import VJEPA21Size, VJEPA21Wrapper
+        wrapper = VJEPA21Wrapper(size=VJEPA21Size[cfg.vjepa_size], image_height=h, image_width=w, verbose=False)
+
+        def featurize(x):
+            return wrapper.extract_hierarchical(x)
+    else:
+        ds = CachedDepthDataset(
+            cfg.val_sequences, cfg.kitti_sequences_dir, cfg.embedding_dirname,
+            cfg.min_depth, cfg.max_depth, cfg.target_hw,
+        )
+
+        def featurize(x):
+            return x.to(device)
+
+    x, depth, valid = ds[index]
     depth_path = ds.samples[index][1]
 
     with torch.no_grad():
-        pred = predict_depth(probe, feat[None].to(device), depth.shape[-2:])
+        pred = predict_depth(probe, featurize(x[None]), depth.shape[-2:])
         pred = pred.clamp(cfg.min_depth, cfg.max_depth)[0, 0].cpu().numpy()
 
     gt = depth[0].numpy()

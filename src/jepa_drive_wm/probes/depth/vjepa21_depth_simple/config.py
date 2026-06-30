@@ -21,6 +21,13 @@ class DepthProbeConfig:
     # --- data ---------------------------------------------------------------
     kitti_sequences_dir: str = KITTI_SEQUENCES_DIR
     embedding_dirname: str = EMBEDDING_DIRNAME
+    # Feature source. "cached" reads precomputed .npy (embedding_dirname); "online"
+    # encodes each batch through the frozen VJEPA encoder in the train loop (no disk
+    # cache — use this when the 4-layer cache is too big for your SSD). For the DPT head,
+    # "online" requires nothing on disk beyond the KITTI images themselves.
+    feature_mode: str = "cached"          # "cached" or "online"
+    image_dirname: str = "image_2"        # online mode: KITTI camera folder to encode
+    vjepa_size: str = "BASE"              # online mode: VJEPA21Size name of the frozen encoder
     # All 22 sequences have both depth + embeddings. Sequence-level holdout:
     # val_sequences are held out; ``train_sequences`` (property below) is then
     # "everything else". To pin a custom train set, set ``train_override``.

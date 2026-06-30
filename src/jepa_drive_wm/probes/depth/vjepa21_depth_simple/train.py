@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .config import DepthProbeConfig
-from .dataset import CachedDepthDataset, depth_collate
+from .dataset import CachedDepthDataset, ImageDepthDataset, depth_collate
 from .head import DepthProbe
 from .losses import build_loss
 from .metrics import calculate_depth_metrics
@@ -40,17 +40,49 @@ def _warmup_cosine(warmup: int, total: int, min_ratio: float = 0.01):
     return lr_lambda
 
 
-def build_loaders(cfg: DepthProbeConfig):
-    common = dict(
-        kitti_sequences_dir=cfg.kitti_sequences_dir,
-        embedding_dirname=cfg.embedding_dirname,
-        min_depth=cfg.min_depth,
-        max_depth=cfg.max_depth,
-        target_hw=cfg.target_hw,
-        ram_cache=cfg.ram_cache,
-    )
-    train_ds = CachedDepthDataset(cfg.train_sequences, **common)
-    val_ds = CachedDepthDataset(cfg.val_sequences, **common)
+def build_loaders(cfg: DepthProbeConfig, device):
+    """Build train/val loaders and a ``featurize`` callable mapping a batch's first
+    element to ``(B, ...)`` features on ``device``.
+
+    "cached": the loader already yields features -> ``featurize`` just moves them to GPU.
+    "online": the loader yields preprocessed images -> ``featurize`` runs the frozen
+    VJEPA encoder (4-layer tap) on each batch, so nothing is cached to disk.
+    """
+    if cfg.feature_mode == "online":
+        h, w = cfg.target_hw
+        common = dict(
+            kitti_sequences_dir=cfg.kitti_sequences_dir,
+            image_dirname=cfg.image_dirname,
+            min_depth=cfg.min_depth,
+            max_depth=cfg.max_depth,
+            target_hw=cfg.target_hw,
+            image_height=h,
+            image_width=w,
+        )
+        train_ds = ImageDepthDataset(cfg.train_sequences, **common)
+        val_ds = ImageDepthDataset(cfg.val_sequences, **common)
+
+        from jepa_drive_wm.utils.vjepa_wrapper import VJEPA21Size, VJEPA21Wrapper
+        wrapper = VJEPA21Wrapper(
+            size=VJEPA21Size[cfg.vjepa_size], image_height=h, image_width=w, verbose=True,
+        )
+
+        def featurize(x: torch.Tensor) -> torch.Tensor:
+            return wrapper.extract_hierarchical(x)  # (B,C,H,W) -> (B,L,D,gh,gw) on device
+    else:
+        common = dict(
+            kitti_sequences_dir=cfg.kitti_sequences_dir,
+            embedding_dirname=cfg.embedding_dirname,
+            min_depth=cfg.min_depth,
+            max_depth=cfg.max_depth,
+            target_hw=cfg.target_hw,
+            ram_cache=cfg.ram_cache,
+        )
+        train_ds = CachedDepthDataset(cfg.train_sequences, **common)
+        val_ds = CachedDepthDataset(cfg.val_sequences, **common)
+
+        def featurize(x: torch.Tensor) -> torch.Tensor:
+            return x.to(device)
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
@@ -60,7 +92,7 @@ def build_loaders(cfg: DepthProbeConfig):
         val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers,
         collate_fn=depth_collate, pin_memory=True,
     )
-    return train_loader, val_loader
+    return train_loader, val_loader, featurize
 
 
 def predict_depth(probe: DepthProbe, feat: torch.Tensor, out_hw: tuple[int, int]) -> torch.Tensor:
@@ -76,14 +108,15 @@ def predict_depth(probe: DepthProbe, feat: torch.Tensor, out_hw: tuple[int, int]
 
 
 @torch.no_grad()
-def evaluate(probe: DepthProbe, val_loader, cfg: DepthProbeConfig, device, max_batches=None) -> dict:
+def evaluate(probe: DepthProbe, val_loader, cfg: DepthProbeConfig, device, featurize, max_batches=None) -> dict:
     probe.eval()
     names = ("a1", "a2", "a3", "abs_rel", "rmse", "silog")
     totals = {n: 0.0 for n in names}
     count = 0
     batches = val_loader if max_batches is None else islice(val_loader, max_batches)
-    for feat, depth, valid in batches:
-        feat, depth, valid = feat.to(device), depth.to(device), valid.to(device)
+    for x, depth, valid in batches:
+        feat = featurize(x)
+        depth, valid = depth.to(device), valid.to(device)
         pred = predict_depth(probe, feat, depth.shape[-2:])
         pred = pred.clamp(cfg.min_depth, cfg.max_depth)
         m = calculate_depth_metrics(depth, pred, valid)
@@ -100,19 +133,21 @@ def train(cfg: DepthProbeConfig | None = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(cfg.out_dir, exist_ok=True)
 
-    train_loader, val_loader = build_loaders(cfg)
+    train_loader, val_loader, featurize = build_loaders(cfg, device)
     probe = DepthProbe.from_config(cfg).to(device)
     criterion = build_loss(cfg.losses).to(device)
     optim = torch.optim.AdamW(probe.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, _warmup_cosine(cfg.warmup_iters, cfg.total_iters))
 
     n_params = sum(p.numel() for p in probe.parameters() if p.requires_grad)
-    print(f"[train] device={device}  head={cfg.head_type}  trainable params={n_params:,}  iters={cfg.total_iters}")
+    print(f"[train] device={device}  head={cfg.head_type}  feature_mode={cfg.feature_mode}  "
+          f"trainable params={n_params:,}  iters={cfg.total_iters}")
 
     best_abs_rel = float("inf")
     probe.train()
-    for it, (feat, depth, valid) in enumerate(islice(_infinite(train_loader), cfg.total_iters), start=1):
-        feat, depth, valid = feat.to(device), depth.to(device), valid.to(device)
+    for it, (x, depth, valid) in enumerate(islice(_infinite(train_loader), cfg.total_iters), start=1):
+        feat = featurize(x)
+        depth, valid = depth.to(device), valid.to(device)
         pred = predict_depth(probe, feat, depth.shape[-2:])
         loss = criterion(pred, depth, valid)
 
@@ -126,7 +161,7 @@ def train(cfg: DepthProbeConfig | None = None):
             print(f"[train] iter {it:>6}/{cfg.total_iters}  loss {loss.item():.4f}  lr {sched.get_last_lr()[0]:.2e}")
 
         if it % cfg.eval_every == 0 or it == cfg.total_iters:
-            metrics = evaluate(probe, val_loader, cfg, device)
+            metrics = evaluate(probe, val_loader, cfg, device, featurize)
             msg = "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
             print(f"[eval ] iter {it:>6}  {msg}")
             if metrics["abs_rel"] < best_abs_rel:
