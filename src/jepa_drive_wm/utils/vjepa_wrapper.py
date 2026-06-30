@@ -278,6 +278,45 @@ class VJEPA21Wrapper:
             out = self.encoder(x)
         return out.to("cpu", self.output_dtype)
 
+    @torch.inference_mode()
+    def _run_encoder_multi(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the encoder in multi-layer mode and stack the per-layer outputs.
+
+        Requires ``self.encoder.out_layers`` to be set (done by
+        ``_enable_hierarchical``), which makes ``VisionTransformer.forward`` return a
+        ``list`` of per-layer normed token tensors (each ``(B, N, D)``) instead of a
+        single final-layer tensor. Returns ``(B, L, N, D)`` on cpu.
+        """
+        x = x.to(self.device, self.compute_dtype if self.device.type == "cuda" else None)
+        if self.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=self.compute_dtype):
+                outs = self.encoder(x)
+        else:
+            outs = self.encoder(x)
+        if not isinstance(outs, (list, tuple)):
+            raise RuntimeError(
+                "Expected a list of per-layer outputs from the encoder; got a single "
+                "tensor. Was encoder.out_layers set? (call _enable_hierarchical first)"
+            )
+        stacked = torch.stack(list(outs), dim=1)  # (B, L, N, D)
+        return stacked.to("cpu", self.output_dtype)
+
+    def _enable_hierarchical(self) -> list[int]:
+        """Put the encoder into multi-layer output mode and return the tapped layers.
+
+        Sets ``encoder.out_layers`` to the model's predefined ``hierarchical_layers``
+        ([2,5,8,11] for ViT-B). Each tapped block is normed by its own ``norms_block``
+        entry. Idempotent.
+        """
+        layers = list(self.encoder.hierarchical_layers)
+        if getattr(self.encoder, "out_layers", None) != layers:
+            self.encoder.out_layers = layers
+        return layers
+
+    @property
+    def hierarchical_layers(self) -> list[int]:
+        return list(self.encoder.hierarchical_layers)
+
     def encode_images(
         self, images: Union[ImageLike, Sequence[ImageLike]], batch_size: int = 8
     ) -> torch.Tensor:
@@ -310,6 +349,26 @@ class VJEPA21Wrapper:
         clip = self._stack_frames(frames)            # (T,C,H,W)
         clip = clip.permute(1, 0, 2, 3).unsqueeze(0)  # (1,C,T,H,W)
         return self._run_encoder(clip)
+
+    def encode_images_hierarchical(
+        self, images: Union[ImageLike, Sequence[ImageLike]], batch_size: int = 8
+    ) -> torch.Tensor:
+        """Encode frames *independently* (image mode, T=1), tapping 4 layers.
+
+        Returns ``(N, L, grid_h * grid_w, embed_dim)`` on cpu, where ``L`` is the number
+        of hierarchical layers ([2,5,8,11] for ViT-B). Each layer is the token grid for
+        that frame at that depth, normed by the encoder's per-layer norm. The last layer
+        (11) matches what ``encode_images`` returns.
+        """
+        if isinstance(images, (str, Path, Image.Image, torch.Tensor)):
+            images = [images]
+        self._enable_hierarchical()
+        chunks = []
+        for i in range(0, len(images), batch_size):
+            batch = self._stack_frames(images[i : i + batch_size])     # (B,C,H,W)
+            batch = batch.unsqueeze(2)                                 # (B,C,1,H,W)
+            chunks.append(self._run_encoder_multi(batch))             # (B,L,N,D)
+        return torch.cat(chunks, dim=0)
 
     # ------------------------------------------------------------------
     # Token geometry

@@ -107,13 +107,25 @@ class CachedDepthDataset(Dataset):
         return len(self.samples)
 
     def _load_features(self, idx: int) -> torch.Tensor:
-        """Return features as (D, gh, gw) float32."""
+        """Return features as (D, gh, gw), or (L, D, gh, gw) for a hierarchical cache.
+
+        A 2-D cache array ``(gh*gw, D)`` is the legacy single (final) layer. A 3-D array
+        ``(L, gh*gw, D)`` is the 4-layer hierarchical cache written with
+        ``--hierarchical`` (one grid per tapped layer), used by the DPT head.
+        """
         if self.ram_cache and idx in self._feat_cache:
             return self._feat_cache[idx].float()
 
         npy_path, _, gh, gw = self.samples[idx]
-        arr = np.load(npy_path)                                   # (gh*gw, D) fp16
-        feat = torch.from_numpy(arr).reshape(gh, gw, -1).permute(2, 0, 1).contiguous()
+        arr = np.load(npy_path)                                   # (gh*gw, D) or (L, gh*gw, D) fp16
+        t = torch.from_numpy(arr)
+        if t.ndim == 3:
+            # (L, gh*gw, D) -> (L, D, gh, gw)
+            L = t.shape[0]
+            feat = t.reshape(L, gh, gw, -1).permute(0, 3, 1, 2).contiguous()
+        else:
+            # (gh*gw, D) -> (D, gh, gw)
+            feat = t.reshape(gh, gw, -1).permute(2, 0, 1).contiguous()
         if self.ram_cache:
             self._feat_cache[idx] = feat  # keep fp16 to save RAM
         return feat.float()
