@@ -161,7 +161,9 @@ def train(cfg: DepthProbeConfig | None = None):
             print(f"[train] iter {it:>6}/{cfg.total_iters}  loss {loss.item():.4f}  lr {sched.get_last_lr()[0]:.2e}")
 
         if it % cfg.eval_every == 0 or it == cfg.total_iters:
-            metrics = evaluate(probe, val_loader, cfg, device, featurize)
+            # Sample the val set during training; run the full set only at the end.
+            max_b = None if it == cfg.total_iters else cfg.eval_max_batches
+            metrics = evaluate(probe, val_loader, cfg, device, featurize, max_batches=max_b)
             msg = "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
             print(f"[eval ] iter {it:>6}  {msg}")
             if metrics["abs_rel"] < best_abs_rel:
