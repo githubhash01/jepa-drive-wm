@@ -350,6 +350,35 @@ class VJEPA21Wrapper:
         clip = clip.permute(1, 0, 2, 3).unsqueeze(0)  # (1,C,T,H,W)
         return self._run_encoder(clip)
 
+    @torch.no_grad()
+    def extract_hierarchical(self, batch_chw: torch.Tensor) -> torch.Tensor:
+        """Frozen 4-layer feature extraction for *online* training (no disk cache).
+
+        ``batch_chw``: an already-preprocessed ``(B, C, H, W)`` batch (resized to the
+        wrapper's resolution + ImageNet-normalised, e.g. by ``ImageDepthDataset``).
+        Returns ``(B, L, D, grid_h, grid_w)`` on this wrapper's device, ready to feed the
+        depth head — like a batch of the hierarchical cache but computed on the fly.
+
+        Uses ``torch.no_grad`` (not ``inference_mode``): the encoder is frozen so we want
+        no gradients through it, but the output must still be usable as input to a
+        *trainable* head, which inference-mode tensors are not.
+        """
+        self._enable_hierarchical()
+        x = batch_chw.to(self.device, self.compute_dtype if self.device.type == "cuda" else None)
+        x = x.unsqueeze(2)  # (B,C,H,W) -> (B,C,1,H,W) routes to the image patch-embed
+        if self.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=self.compute_dtype):
+                outs = self.encoder(x)
+        else:
+            outs = self.encoder(x)
+        if not isinstance(outs, (list, tuple)):
+            raise RuntimeError("Expected a list of per-layer outputs; was out_layers set?")
+        stacked = torch.stack(list(outs), dim=1)  # (B, L, N, D)
+        B, L, _, D = stacked.shape
+        lay = self.layout(num_frames=1)
+        feat = stacked.reshape(B, L, lay.grid_h, lay.grid_w, D).permute(0, 1, 4, 2, 3).contiguous()
+        return feat.float()
+
     def encode_images_hierarchical(
         self, images: Union[ImageLike, Sequence[ImageLike]], batch_size: int = 8
     ) -> torch.Tensor:

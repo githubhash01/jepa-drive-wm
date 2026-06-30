@@ -28,6 +28,16 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision import transforms
+
+# Must match VJEPA21Wrapper.IMAGENET_MEAN/STD so online-encoded features are identical
+# to the cached ones (which were built with the wrapper's preprocessing).
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _image_path(sequences_dir: str, seq: int, frame: int, image_dirname: str) -> str:
+    return os.path.join(sequences_dir, f"{seq:02d}", image_dirname, f"{frame:06d}.png")
 
 
 def _embedding_dir(sequences_dir: str, seq: int, dirname: str) -> str:
@@ -145,8 +155,87 @@ class CachedDepthDataset(Dataset):
         return feat, depth, valid
 
 
+class ImageDepthDataset(Dataset):
+    """Raw KITTI image + depth, for *online* feature extraction (no cached .npy).
+
+    Returns ``(image_chw, depth, valid)`` where ``image_chw`` is the preprocessed RGB
+    tensor (resized + ImageNet-normalised, exactly matching ``VJEPA21Wrapper``). The
+    training loop runs the frozen encoder on the batched images to get the 4-layer
+    features, so nothing is written to disk. Depth/mask handling mirrors
+    ``CachedDepthDataset`` so the two modes are interchangeable.
+    """
+
+    def __init__(
+        self,
+        sequences: Sequence[int],
+        kitti_sequences_dir: str,
+        image_dirname: str = "image_2",
+        min_depth: float = 0.001,
+        max_depth: float = 80.0,
+        target_hw: Optional[tuple[int, int]] = (384, 1248),
+        image_height: int = 384,
+        image_width: int = 1248,
+    ):
+        self.kitti_sequences_dir = kitti_sequences_dir
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.target_hw = target_hw
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((image_height, image_width)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ]
+        )
+
+        # Intersect images with depth PNGs, frame by frame.
+        self.samples: list[tuple[str, str]] = []
+        for seq in sequences:
+            img_dir = os.path.join(kitti_sequences_dir, f"{seq:02d}", image_dirname)
+            img_paths = sorted(glob.glob(os.path.join(img_dir, "*.png")))
+            if not img_paths:
+                print(f"[ImageDepthDataset] no images for seq {seq:02d}: {img_dir}")
+                continue
+            kept = 0
+            skipped_empty = 0
+            for img in img_paths:
+                frame = int(os.path.basename(img)[:-4])
+                depth_path = _depth_png_path(kitti_sequences_dir, seq, frame)
+                if not os.path.exists(depth_path):
+                    continue
+                if os.path.getsize(depth_path) == 0:
+                    skipped_empty += 1
+                    continue
+                self.samples.append((img, depth_path))
+                kept += 1
+            note = f" ({skipped_empty} empty/corrupt skipped)" if skipped_empty else ""
+            print(f"[ImageDepthDataset] seq {seq:02d}: {kept}/{len(img_paths)} frames have depth{note}")
+
+        if not self.samples:
+            raise RuntimeError(f"No frames with both images and depth for sequences {list(sequences)}")
+        print(f"[ImageDepthDataset] total samples: {len(self.samples)}")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        img_path, depth_path = self.samples[idx]
+        x = self.transform(Image.open(img_path).convert("RGB"))  # (C, H, W)
+
+        depth = torch.from_numpy(load_depth_metres(depth_path))[None]  # (1, H, W)
+        valid = (depth > self.min_depth) & (depth < self.max_depth) & torch.isfinite(depth)
+        if self.target_hw is not None and tuple(depth.shape[-2:]) != tuple(self.target_hw):
+            depth = F.interpolate(depth[None].float(), size=self.target_hw, mode="nearest")[0]
+            valid = F.interpolate(valid[None].float(), size=self.target_hw, mode="nearest")[0] > 0.5
+        return x, depth, valid
+
+
 def depth_collate(batch):
-    """Stack a batch. Features share one grid; depth/mask share ``target_hw``."""
+    """Stack a batch. Features share one grid; depth/mask share ``target_hw``.
+
+    Works for both modes: the first element is cached features ((D,gh,gw) or
+    (L,D,gh,gw)) or a preprocessed image ((C,H,W)); ``torch.stack`` adds the batch dim.
+    """
     feats, depths, valids = zip(*batch)
     depth_shapes = {tuple(d.shape) for d in depths}
     if len(depth_shapes) != 1:
