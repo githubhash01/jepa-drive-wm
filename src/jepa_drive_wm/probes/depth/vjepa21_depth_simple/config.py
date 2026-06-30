@@ -44,9 +44,21 @@ class DepthProbeConfig:
     # --- head ---------------------------------------------------------------
     embed_dim: int = 768                 # V-JEPA 2.1 BASE (vit_base)
     use_batchnorm: bool = True
-    head_type: str = "conv"              # "conv" (learned upsampling) or "linear" (1x1 baseline)
+    head_type: str = "conv"              # "conv", "linear", or "dpt" (4-layer DPT)
     decoder_channels: int = 256          # conv decoder width at the patch grid
     decoder_upsample: int = 3            # conv decoder 2x upsample steps: 24x78 -> 192x624
+
+    # --- dpt head (only used when head_type == "dpt") -----------------------
+    # Fuses 4 intermediate VJEPA layers ([2,5,8,11]) DINOV3-style. Requires the
+    # hierarchical cache, so point ``embedding_dirname`` at "vjepa_vitb_hier".
+    n_layers: int = 4                    # number of tapped layers in the hierarchical cache
+    dpt_channels: int = 256              # common channel width inside the DPT fusion path
+    dpt_post_process_channels: tuple[int, ...] = (128, 256, 512, 1024)
+    dpt_readout: str = "ignore"          # VJEPA has no CLS token -> ignore readout
+    dpt_use_batchnorm: bool = False      # keep off SyncBatchNorm (needs a process group)
+    # DPT emits n_bins channels at full 384x1248 res -> heavy activations. On an ~8 GB
+    # GPU use batch_size=1 with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # (batch_size>=2 OOMs); larger GPUs can raise it.
 
     # --- optimisation -------------------------------------------------------
     lr: float = 3e-4

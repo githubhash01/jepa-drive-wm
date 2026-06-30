@@ -16,6 +16,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from .dpt_head import DPTHead
+
 
 class LinearDepthHead(nn.Module):
     """Optional BatchNorm + 1x1 conv mapping patch features to per-bin logits.
@@ -151,13 +153,72 @@ class FeaturesToDepth(nn.Module):
         return depth
 
 
+class DPTDepthHead(nn.Module):
+    """4-layer DPT head (DINOv3 protocol) over stacked hierarchical V-JEPA features.
+
+    Input is the hierarchical cache ``(B, L, D, gh, gw)`` — one patch grid per tapped
+    layer ([2,5,8,11] for ViT-B). The DPT head reassembles each layer to a different
+    scale, fuses them coarse-to-fine, and emits ``n_bins`` per-pixel logits at full
+    resolution (24x78 grid -> 384x1248), which ``FeaturesToDepth`` turns into depth.
+
+    V-JEPA has no CLS token, so ``readout_type="ignore"``: the DPT head's reassemble
+    blocks never touch the (here zero) readout token. ``use_batchnorm=False`` keeps the
+    head off ``torch.nn.SyncBatchNorm`` (which needs a process group; would crash a
+    single-GPU run).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 768,
+        n_bins: int = 256,
+        n_layers: int = 4,
+        channels: int = 256,
+        post_process_channels: tuple[int, ...] = (128, 256, 512, 1024),
+        readout_type: str = "ignore",
+        use_batchnorm: bool = False,
+    ):
+        super().__init__()
+        if n_layers != 4:
+            raise ValueError(
+                f"DPTHead's reassemble stage is fixed to 4 layers; got n_layers={n_layers}."
+            )
+        self.n_layers = n_layers
+        self.dpt = DPTHead(
+            in_channels=tuple(embed_dim for _ in range(n_layers)),
+            channels=channels,
+            post_process_channels=list(post_process_channels),
+            readout_type=readout_type,
+            n_output_channels=n_bins,
+            use_batchnorm=use_batchnorm,
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        # features: (B, L, D, gh, gw) -> logits: (B, n_bins, H, W)
+        if features.ndim != 5:
+            raise ValueError(
+                f"DPTDepthHead expects (B, L, D, gh, gw) hierarchical features; got "
+                f"shape {tuple(features.shape)}. Use the 'vjepa_vitb_hier' cache."
+            )
+        if features.shape[1] != self.n_layers:
+            raise ValueError(
+                f"Expected {self.n_layers} layers, got {features.shape[1]}."
+            )
+        b, _, d = features.shape[0], features.shape[1], features.shape[2]
+        # DPTHead wants a list of [patch_map, readout_token] per layer; readout is
+        # ignored (readout_type='ignore'), so pass a zero placeholder.
+        zero_readout = features.new_zeros((b, d))
+        inputs = [[features[:, i], zero_readout] for i in range(self.n_layers)]
+        return self.dpt(inputs)
+
+
 class DepthProbe(nn.Module):
     """Decoder head + AdaBins depth conversion. Encoder lives offline (cached features).
 
     ``head_type``:
       * "linear" — 1x1 conv on the patch grid (fast baseline, no spatial refinement)
       * "conv"   — convolutional decoder with learned upsampling (sharper, stronger)
-    Both read only the final encoder feature map (B, D, gh, gw).
+      * "dpt"    — 4-layer DPT head fusing intermediate layers (needs hierarchical cache)
+    "linear"/"conv" read the final feature map (B, D, gh, gw); "dpt" reads (B, L, D, gh, gw).
     """
 
     def __init__(
@@ -172,6 +233,11 @@ class DepthProbe(nn.Module):
         head_type: str = "conv",
         decoder_channels: int = 256,
         decoder_upsample: int = 3,
+        n_layers: int = 4,
+        dpt_channels: int = 256,
+        dpt_post_process_channels: tuple[int, ...] = (128, 256, 512, 1024),
+        dpt_readout: str = "ignore",
+        dpt_use_batchnorm: bool = False,
     ):
         super().__init__()
         if head_type == "linear":
@@ -183,8 +249,18 @@ class DepthProbe(nn.Module):
                 n_upsample=decoder_upsample,
                 use_batchnorm=use_batchnorm,
             )
+        elif head_type == "dpt":
+            self.head = DPTDepthHead(
+                embed_dim=embed_dim,
+                n_bins=n_bins,
+                n_layers=n_layers,
+                channels=dpt_channels,
+                post_process_channels=dpt_post_process_channels,
+                readout_type=dpt_readout,
+                use_batchnorm=dpt_use_batchnorm,
+            )
         else:
-            raise ValueError(f"head_type must be 'linear' or 'conv', got {head_type!r}")
+            raise ValueError(f"head_type must be 'linear', 'conv', or 'dpt', got {head_type!r}")
 
         self.features_to_depth = FeaturesToDepth(
             min_depth=min_depth,
@@ -210,4 +286,9 @@ class DepthProbe(nn.Module):
             head_type=cfg.head_type,
             decoder_channels=cfg.decoder_channels,
             decoder_upsample=cfg.decoder_upsample,
+            n_layers=cfg.n_layers,
+            dpt_channels=cfg.dpt_channels,
+            dpt_post_process_channels=cfg.dpt_post_process_channels,
+            dpt_readout=cfg.dpt_readout,
+            dpt_use_batchnorm=cfg.dpt_use_batchnorm,
         )

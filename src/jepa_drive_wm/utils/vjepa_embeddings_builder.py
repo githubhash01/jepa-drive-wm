@@ -72,7 +72,12 @@ def main():
     ap.add_argument("--sequences", type=str, default=None, help="Comma/range list, e.g. '0-21' or '00,02,10'.")
     ap.add_argument("--kitti_root", default="/home/hashim/Desktop/Datasets/KITTI")
     ap.add_argument("--image_dirname", default="image_2", help="Which camera folder to embed.")
-    ap.add_argument("--out_dirname", default="vjepa_vitb", help="Cache folder created inside each sequence.")
+    ap.add_argument("--out_dirname", default=None,
+                    help="Cache folder created inside each sequence. Defaults to "
+                         "'vjepa_vitb' (final layer) or 'vjepa_vitb_hier' with --hierarchical.")
+    ap.add_argument("--hierarchical", action="store_true",
+                    help="Cache 4 intermediate layers ([2,5,8,11] for ViT-B) as (L, num_tokens, D) "
+                         "per frame instead of the final layer only.")
     ap.add_argument("--image_height", type=int, default=384)
     ap.add_argument("--image_width", type=int, default=1248)
     ap.add_argument("--batch_size", type=int, default=8, help="Frames per encoder pass; lower if you hit OOM.")
@@ -83,6 +88,9 @@ def main():
 
     if args.batch_size < 1:
         raise ValueError("--batch_size must be >= 1")
+
+    if args.out_dirname is None:
+        args.out_dirname = "vjepa_vitb_hier" if args.hierarchical else "vjepa_vitb"
 
     np_dtype = np.float16 if args.save_dtype == "fp16" else np.float32
 
@@ -120,6 +128,10 @@ def main():
         meta = wrapper.metadata()
         meta["layout"] = vars(wrapper.layout(num_frames=1))
         meta["save_dtype"] = args.save_dtype
+        meta["hierarchical"] = args.hierarchical
+        if args.hierarchical:
+            meta["out_layers"] = wrapper.hierarchical_layers
+            meta["n_layers"] = len(wrapper.hierarchical_layers)
         (out_dir / "_metadata.json").write_text(json.dumps(meta, indent=2))
 
         work = []
@@ -146,7 +158,10 @@ def main():
             t0 = time.perf_counter()
 
             paths = [p for _, p, _ in batch_items]
-            feats = wrapper.encode_images(paths, batch_size=len(paths))  # (B, num_tokens, D) on cpu
+            if args.hierarchical:
+                feats = wrapper.encode_images_hierarchical(paths, batch_size=len(paths))  # (B, L, num_tokens, D)
+            else:
+                feats = wrapper.encode_images(paths, batch_size=len(paths))  # (B, num_tokens, D) on cpu
 
             for emb, (_, _, out_path) in zip(feats, batch_items):
                 np.save(out_path, emb.numpy().astype(np_dtype, copy=False))
