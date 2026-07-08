@@ -9,7 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # TODO - write global PCA myself
-from core.global_pca import (
+from jepa_drive_wm.data.global_pca import (
     load_pca_npz,
     transform_features_with_saved_pca,
     normalize_pca_rgb,

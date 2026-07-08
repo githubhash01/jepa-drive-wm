@@ -35,7 +35,9 @@ def visualize(ckpt_path: str, index: int = 0, save_path: str | None = None):
     probe.eval()
 
     if cfg.feature_mode == "online":
-        h, w = cfg.target_hw
+        # Input resolution: the checkpoint's training resolution if recorded (curriculum
+        # stages differ), else cfg.image_hw, else target_hw. Depth stays at target_hw.
+        h, w = blob.get("image_hw") or getattr(cfg, "image_hw", None) or cfg.target_hw
         ds = ImageDepthDataset(
             cfg.val_sequences, cfg.kitti_sequences_dir, cfg.image_dirname,
             cfg.min_depth, cfg.max_depth, cfg.target_hw, image_height=h, image_width=w,

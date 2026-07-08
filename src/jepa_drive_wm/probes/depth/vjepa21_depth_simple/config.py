@@ -28,6 +28,15 @@ class DepthProbeConfig:
     feature_mode: str = "cached"          # "cached" or "online"
     image_dirname: str = "image_2"        # online mode: KITTI camera folder to encode
     vjepa_size: str = "BASE"              # online mode: VJEPA21Size name of the frozen encoder
+    # Input image resolution fed to the encoder (online mode). Defaults to target_hw.
+    # Depth is always supervised at target_hw, so this only changes the patch grid.
+    image_hw: Optional[tuple[int, int]] = None
+    # Two-phase / curriculum training (DINO-Foresight resolution adaptation): a list of
+    # per-stage dicts, e.g. [{"image_hw": (192, 624), "iters": 28000, "lr": 3e-4,
+    # "warmup_iters": 1000}, {"image_hw": (384, 1248), "iters": 12000, "lr": 1e-4,
+    # "warmup_iters": 500}]. The SAME probe (fully-conv, so weights transfer across grids)
+    # is carried across stages. If None, a single stage is built from total_iters/lr below.
+    stages: Optional[list] = None
     # All 22 sequences have both depth + embeddings. Sequence-level holdout:
     # val_sequences are held out; ``train_sequences`` (property below) is then
     # "everything else". To pin a custom train set, set ``train_override``.
@@ -40,13 +49,26 @@ class DepthProbeConfig:
     # 384x1248 ~= native and matches the encoder input the embeddings used.
     target_hw: tuple[int, int] = (384, 1248)
     ram_cache: bool = False              # keep fp16 feature tensors in RAM (~3 MB/frame)
+    augment: bool = False                # online mode: random h-flip + colour jitter on the
+                                         # train split (re-encoded each epoch -> free aug)
 
     # --- depth parameterisation --------------------------------------------
     n_bins: int = 256                    # output channels of the linear head
-    min_depth: float = 0.001
-    max_depth: float = 80.0
-    bins_strategy: str = "log"           # "log" or "linear"
+    min_depth: float = 0.001             # valid-mask floor (permissive; masks depth <= this)
+    max_depth: float = 80.0              # valid-mask / clamp ceiling
+    bins_strategy: str = "log"           # "log", "linear", or "mixlog" (DINOv3 log/linear blend)
     norm_strategy: str = "linear"        # AdaBins soft-argmax normalisation
+    # Soft-argmax bin range, DECOUPLED from the valid-mask floor above. KITTI depth is
+    # ~2.2-80m, so the default [0.001, 80] wasted ~67% of log-bins below the nearest real
+    # pixel. Spanning the actual range concentrates all bins where depth occurs (DORN/SID
+    # + AdaBins principle: match the bin distribution to the dataset).
+    bin_min_depth: float = 1.0
+    bin_max_depth: float = 80.0
+    # True adaptive bins (AdaBins): an MLP predicts per-image bin centers within
+    # [bin_min_depth, bin_max_depth] instead of using fixed ones. bin_chamfer_weight adds
+    # the AdaBins bi-directional Chamfer bin-density regulariser so the bins actually adapt.
+    adaptive_bins: bool = False
+    bin_chamfer_weight: float = 0.1
 
     # --- head ---------------------------------------------------------------
     embed_dim: int = 768                 # V-JEPA 2.1 BASE (vit_base)
@@ -72,15 +94,20 @@ class DepthProbeConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 35.0
     batch_size: int = 4                  # conv decoder's high-res bins are memory-heavy on ~8 GB GPUs
+    grad_accum_steps: int = 1            # accumulate this many micro-batches per optimiser step
+                                         # (effective batch = batch_size * grad_accum_steps).
+                                         # Lets bs=1 DPT reach a larger effective batch on 8 GB.
     num_workers: int = 4
-    total_iters: int = 4000
-    warmup_iters: int = 200              # linear LR warm-up before cosine decay
+    total_iters: int = 8000              # micro-batches (frames seen); optimiser updates = /accum
+    warmup_iters: int = 200              # linear LR warm-up before cosine decay (micro-batch units)
     warm_up_loss: bool = True            # SigLoss scale warm-up
 
     # --- eval / logging -----------------------------------------------------
     eval_every: int = 500
     eval_max_batches: int = 150          # periodic eval samples this many val batches
                                          # (the final eval at total_iters runs the full set)
+    eval_scale_align: bool = False       # also report median-scaled metrics (abs_rel_al / a1_al);
+                                         # SigLoss is scale-invariant, so this isolates structure
     log_every: int = 50
     seed: int = 0
     out_dir: str = "/home/hashim/Desktop/Outputs/vjepa21_depth"

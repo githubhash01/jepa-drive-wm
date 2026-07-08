@@ -103,8 +103,11 @@ class ConvDepthDecoder(nn.Module):
 class FeaturesToDepth(nn.Module):
     """Convert per-bin logits to metric depth via AdaBins soft-argmax.
 
-    Copied (log/linear branch only) from probes/depth/dinov3_depth/models/__init__.py.
-    If ``n_bins == 1`` it falls back to plain regression (relu(x) + min_depth).
+    Bin distribution follows probes/depth/dinov3_depth: "log" (scale-invariant / SID),
+    "linear" (uniform), or "mixlog" (DINOv3's log->linear blend). The bin *range*
+    (``bin_min_depth``, ``bin_max_depth``) is separate from the valid-mask floor so it can
+    be set to the dataset's actual depth span (KITTI ~2.2-80m) instead of wasting bins
+    below the nearest real pixel. If ``n_bins == 1`` it falls back to plain regression.
     """
 
     def __init__(
@@ -113,9 +116,11 @@ class FeaturesToDepth(nn.Module):
         max_depth: float = 80.0,
         bins_strategy: str = "log",
         norm_strategy: str = "linear",
+        bin_min_depth: float | None = None,
+        bin_max_depth: float | None = None,
     ):
         super().__init__()
-        assert bins_strategy in ("linear", "log"), "bins_strategy must be 'linear' or 'log'"
+        assert bins_strategy in ("linear", "log", "mixlog"), "bins_strategy must be 'linear', 'log' or 'mixlog'"
         assert norm_strategy in ("linear", "softmax", "sigmoid"), (
             "norm_strategy must be 'linear', 'softmax' or 'sigmoid'"
         )
@@ -123,22 +128,29 @@ class FeaturesToDepth(nn.Module):
         self.max_depth = max_depth
         self.bins_strategy = bins_strategy
         self.norm_strategy = norm_strategy
+        # Bin range defaults to the valid-depth range if not given (backward compatible).
+        self.bin_min_depth = float(bin_min_depth) if bin_min_depth is not None else min_depth
+        self.bin_max_depth = float(bin_max_depth) if bin_max_depth is not None else max_depth
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         n_bins = x.shape[1]
         if n_bins == 1:
             return torch.relu(x) + self.min_depth
 
+        lo, hi = self.bin_min_depth, self.bin_max_depth
         if self.bins_strategy == "linear":
-            bins = torch.linspace(self.min_depth, self.max_depth, n_bins, device=x.device)
-        else:  # "log"
+            bins = torch.linspace(lo, hi, n_bins, device=x.device)
+        elif self.bins_strategy == "log":
             bins = torch.exp(
-                torch.linspace(
-                    torch.log(torch.tensor(self.min_depth)),
-                    torch.log(torch.tensor(self.max_depth)),
-                    n_bins,
-                )
+                torch.linspace(torch.log(torch.tensor(lo)), torch.log(torch.tensor(hi)), n_bins)
             ).to(x.device)
+        else:  # "mixlog": DINOv3's per-index blend of log (near) -> linear (far)
+            lin = torch.linspace(lo, hi, n_bins, device=x.device)
+            log = torch.exp(
+                torch.linspace(torch.log(torch.tensor(lo)), torch.log(torch.tensor(hi)), n_bins)
+            ).to(x.device)
+            t = torch.linspace(1.0, 0.0, n_bins, device=x.device)
+            bins = t * log + (1.0 - t) * lin
 
         if self.norm_strategy == "linear":
             logit = torch.relu(x) + 0.1
@@ -211,6 +223,56 @@ class DPTDepthHead(nn.Module):
         return self.dpt(inputs)
 
 
+class AdaptiveBins(nn.Module):
+    """AdaBins-style per-image adaptive bin centers (Bhat et al., 2021).
+
+    Instead of fixed bin centers, a small MLP reads a global image descriptor (mean-pooled
+    frozen features) and predicts ``n_bins`` positive widths that partition [min, max]; the
+    bin centers become per-image. Combined with the head's per-pixel logits in a soft-argmax,
+    the bins concentrate on each image's actual depth range. (This is the MLP-regressor
+    variant; the original also offers a mini-ViT — mean-pool + MLP is the lighter form.)
+    """
+
+    def __init__(self, in_dim: int, n_bins: int, min_depth: float, max_depth: float, hidden: int = 256):
+        super().__init__()
+        self.min_depth = float(min_depth)
+        self.max_depth = float(max_depth)
+        self.n_bins = n_bins
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, n_bins),
+        )
+
+    def forward(self, global_feat: torch.Tensor) -> torch.Tensor:
+        """global_feat: (B, in_dim) -> bin centers (B, n_bins), ascending in [min, max]."""
+        w = self.mlp(global_feat.float())            # (B, n_bins) raw width logits
+        w = torch.softmax(w, dim=1) + 1e-3           # positive normalised widths
+        w = w / w.sum(dim=1, keepdim=True)
+        w = w * (self.max_depth - self.min_depth)    # scale to the depth span
+        # centers = left edge + half width; left edges are the cumulative sum of prior widths.
+        left = self.min_depth + torch.cat(
+            [torch.zeros_like(w[:, :1]), torch.cumsum(w[:, :-1], dim=1)], dim=1
+        )
+        centers = left + w / 2.0                     # (B, n_bins)
+        return centers
+
+
+def _softargmax_with_centers(logits: torch.Tensor, centers: torch.Tensor, norm_strategy: str) -> torch.Tensor:
+    """Per-image soft-argmax: (B, n_bins, H, W) logits + (B, n_bins) centers -> (B, 1, H, W)."""
+    if norm_strategy == "softmax":
+        p = torch.softmax(logits, dim=1)
+    elif norm_strategy == "sigmoid":
+        p = torch.sigmoid(logits)
+        p = p / p.sum(dim=1, keepdim=True)
+    else:  # "linear"
+        p = torch.relu(logits) + 0.1
+        p = p / p.sum(dim=1, keepdim=True)
+    depth = torch.einsum("bkhw,bk->bhw", p.float(), centers.float()).unsqueeze(1)
+    return depth
+
+
 class DepthProbe(nn.Module):
     """Decoder head + AdaBins depth conversion. Encoder lives offline (cached features).
 
@@ -219,6 +281,9 @@ class DepthProbe(nn.Module):
       * "conv"   — convolutional decoder with learned upsampling (sharper, stronger)
       * "dpt"    — 4-layer DPT head fusing intermediate layers (needs hierarchical cache)
     "linear"/"conv" read the final feature map (B, D, gh, gw); "dpt" reads (B, L, D, gh, gw).
+
+    ``adaptive_bins=True`` predicts per-image bin centers (AdaBins) instead of fixed bins;
+    the last predicted centers are stored on ``self.bin_centers`` for the Chamfer bin loss.
     """
 
     def __init__(
@@ -229,6 +294,8 @@ class DepthProbe(nn.Module):
         max_depth: float = 80.0,
         bins_strategy: str = "log",
         norm_strategy: str = "linear",
+        bin_min_depth: float | None = None,
+        bin_max_depth: float | None = None,
         use_batchnorm: bool = True,
         head_type: str = "conv",
         decoder_channels: int = 256,
@@ -238,8 +305,13 @@ class DepthProbe(nn.Module):
         dpt_post_process_channels: tuple[int, ...] = (128, 256, 512, 1024),
         dpt_readout: str = "ignore",
         dpt_use_batchnorm: bool = False,
+        adaptive_bins: bool = False,
     ):
         super().__init__()
+        self.head_type = head_type
+        self.norm_strategy = norm_strategy
+        self.adaptive_bins = adaptive_bins
+        self.bin_centers: torch.Tensor | None = None  # last predicted centers (for chamfer loss)
         if head_type == "linear":
             self.head: nn.Module = LinearDepthHead(embed_dim, n_bins, use_batchnorm=use_batchnorm)
         elif head_type == "conv":
@@ -267,11 +339,34 @@ class DepthProbe(nn.Module):
             max_depth=max_depth,
             bins_strategy=bins_strategy,
             norm_strategy=norm_strategy,
+            bin_min_depth=bin_min_depth,
+            bin_max_depth=bin_max_depth,
         )
 
+        if adaptive_bins:
+            # Global descriptor = mean-pooled features across the patch grid. For the DPT
+            # head that's all L layers concatenated (L*D); otherwise the single map (D).
+            in_dim = (n_layers * embed_dim) if head_type == "dpt" else embed_dim
+            self.adaptive = AdaptiveBins(
+                in_dim=in_dim, n_bins=n_bins,
+                min_depth=self.features_to_depth.bin_min_depth,
+                max_depth=self.features_to_depth.bin_max_depth,
+            )
+
+    def _global_descriptor(self, features: torch.Tensor) -> torch.Tensor:
+        # (B, L, D, gh, gw) -> (B, L*D) ; or (B, D, gh, gw) -> (B, D)
+        if features.ndim == 5:
+            return features.mean(dim=(3, 4)).flatten(1)
+        return features.mean(dim=(2, 3))
+
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        # features: (B, D, gh, gw) -> depth: (B, 1, h, w) at the decoder's output resolution
-        return self.features_to_depth(self.head(features))
+        # features -> depth (B, 1, h, w) at the decoder's output resolution
+        logits = self.head(features)
+        if self.adaptive_bins:
+            centers = self.adaptive(self._global_descriptor(features))  # (B, n_bins)
+            self.bin_centers = centers
+            return _softargmax_with_centers(logits, centers, self.norm_strategy)
+        return self.features_to_depth(logits)
 
     @classmethod
     def from_config(cls, cfg) -> "DepthProbe":
@@ -282,6 +377,8 @@ class DepthProbe(nn.Module):
             max_depth=cfg.max_depth,
             bins_strategy=cfg.bins_strategy,
             norm_strategy=cfg.norm_strategy,
+            bin_min_depth=getattr(cfg, "bin_min_depth", None),
+            bin_max_depth=getattr(cfg, "bin_max_depth", None),
             use_batchnorm=cfg.use_batchnorm,
             head_type=cfg.head_type,
             decoder_channels=cfg.decoder_channels,
@@ -291,4 +388,5 @@ class DepthProbe(nn.Module):
             dpt_post_process_channels=cfg.dpt_post_process_channels,
             dpt_readout=cfg.dpt_readout,
             dpt_use_batchnorm=cfg.dpt_use_batchnorm,
+            adaptive_bins=getattr(cfg, "adaptive_bins", False),
         )
