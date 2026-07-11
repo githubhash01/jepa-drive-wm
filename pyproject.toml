@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jepa-drive-wm"
+version = "0.0.0"
+description = "JEPA driving world model"
+requires-python = ">=3.10"
+# Runtime deps are managed in the conda env (vjepa2_env), so they are
+# intentionally left out here to avoid pip re-resolving torch/etc.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
