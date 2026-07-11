@@ -10,9 +10,9 @@ Entry points:
                 Cityscapes classes and as the coarse planning grouping (the
                 grouping is derived on the fly, never saved).
 
-    python -m jepa_drive_wm.probes.semantics.oneformer_kitti build-all
-    python -m jepa_drive_wm.probes.semantics.oneformer_kitti build --seq 10
-    python -m jepa_drive_wm.probes.semantics.oneformer_kitti viz   --seq 10 --frame 0
+    python -m jepa_drive_wm.utils.oneformer_kitti build-all
+    python -m jepa_drive_wm.utils.oneformer_kitti build --seq 10
+    python -m jepa_drive_wm.utils.oneformer_kitti viz   --seq 10 --frame 0
 
 Efficiency notes (tuned for an 8 GB RTX 4070):
   * fp16 autocast on the forward pass  -> ~2x faster, ~half the memory
@@ -43,6 +43,11 @@ from tqdm import tqdm
 from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
 
 from jepa_drive_wm.data.kitti import KITTISequence
+# Shared Cityscapes taxonomy (colours + 19->5 planning grouping) lives with the semseg task.
+from jepa_drive_wm.probes.dense.taxonomy import (
+    CITYSCAPES, CLASS_NAMES, PALETTE, GROUPS, GROUP_NAMES, GROUP_PALETTE,
+    CLASS_TO_GROUP, labels_to_groups,
+)
 
 MODEL_ID = "shi-labs/oneformer_cityscapes_swin_large"
 DATASET_ROOT = Path("/home/hashim/Desktop/Datasets/KITTI/semantic_oneformer")
@@ -56,75 +61,7 @@ SHORTEST_EDGE = 384
 # Fixed-size KITTI inputs -> let cuDNN pick the fastest kernels.
 torch.backends.cudnn.benchmark = True
 
-# --- 19 Cityscapes classes (train ids 0..18) with fixed, human-readable colours.
-#     Colours are chosen so classes that matter for driving but look similar
-#     (road vs sidewalk vs terrain) are far apart in hue.
-CITYSCAPES = [
-    ("road",          (128,  64, 128)),  # 0   purple
-    ("sidewalk",      (255, 128,   0)),  # 1   orange
-    ("building",      (110, 110, 110)),  # 2   grey
-    ("wall",          (166, 100,  40)),  # 3   brown
-    ("fence",         (190, 153, 153)),  # 4   dusty pink
-    ("pole",          (230, 230, 230)),  # 5   near-white
-    ("traffic light", (250, 170,  30)),  # 6   amber
-    ("traffic sign",  (220, 220,   0)),  # 7   yellow
-    ("vegetation",    ( 60, 160,  40)),  # 8   green
-    ("terrain",       (152, 251, 152)),  # 9   pale mint
-    ("sky",           ( 70, 180, 250)),  # 10  cyan-blue
-    ("person",        (255,   0,   0)),  # 11  red
-    ("rider",         (255,   0, 200)),  # 12  magenta
-    ("car",           (  0,   0, 230)),  # 13  blue
-    ("truck",         (  0, 128, 255)),  # 14  light blue
-    ("bus",           (140,   0, 255)),  # 15  violet
-    ("train",         (  0,  80, 100)),  # 16  dark teal
-    ("motorcycle",    (255, 200,   0)),  # 17  gold
-    ("bicycle",       (119,  11,  32)),  # 18  maroon
-]
-CLASS_NAMES = [name for name, _ in CITYSCAPES]
-PALETTE = np.array([c for _, c in CITYSCAPES], dtype=np.uint8)
-
-# --- Coarse planning-relevant groups. Each fine class maps to exactly one.
-GROUPS = [
-    ("drivable",        ( 80, 200,  80)),  # 0  road surface the car drives on  -> green
-    ("soft-drivable",   (200, 230, 120)),  # 1  traversable-ish (pavement/grass) -> yellow-green
-    ("static obstacle", (140, 140, 140)),  # 2  fixed non-drivable geometry      -> grey
-    ("dynamic object",  (230,  30,  30)),  # 3  things that move                 -> red
-    ("sky / ignore",    (120, 190, 240)),  # 4  no planning meaning              -> light blue
-]
-GROUP_NAMES = [name for name, _ in GROUPS]
-GROUP_PALETTE = np.array([c for _, c in GROUPS], dtype=np.uint8)
-
-DRIVABLE, SOFT, STATIC, DYNAMIC, SKY = 0, 1, 2, 3, 4
-
-# Fine Cityscapes class id (0..18) -> coarse planning group id.
-CLASS_TO_GROUP = np.array([
-    DRIVABLE,   # 0  road
-    SOFT,       # 1  sidewalk      (pavement)
-    STATIC,     # 2  building
-    STATIC,     # 3  wall
-    STATIC,     # 4  fence
-    STATIC,     # 5  pole
-    STATIC,     # 6  traffic light
-    STATIC,     # 7  traffic sign
-    STATIC,     # 8  vegetation
-    SOFT,       # 9  terrain       (grass/dirt verge)
-    SKY,        # 10 sky
-    DYNAMIC,    # 11 person
-    DYNAMIC,    # 12 rider
-    DYNAMIC,    # 13 car
-    DYNAMIC,    # 14 truck
-    DYNAMIC,    # 15 bus
-    DYNAMIC,    # 16 train
-    DYNAMIC,    # 17 motorcycle
-    DYNAMIC,    # 18 bicycle
-], dtype=np.int64)
-
 ALL_SEQUENCES = list(range(22))  # KITTI odometry sequences 00..21
-
-
-def labels_to_groups(label_map: np.ndarray) -> np.ndarray:
-    """Map an (H, W) array of Cityscapes class ids to coarse planning group ids."""
-    return CLASS_TO_GROUP[label_map]
 
 
 # --------------------------------------------------------------------------- #
