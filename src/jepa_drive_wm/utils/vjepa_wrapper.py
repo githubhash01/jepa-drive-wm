@@ -155,6 +155,7 @@ class VJEPA21Wrapper:
 
         
         self._checkpoint_blob: Optional[dict] = None   # lazy, freeable cache
+        self._predictor_embed: Optional[torch.nn.Linear] = None  # lazy predictor input projection
 
         # Built once; the original rebuilt this per embed_image call.
         self._preprocess = transforms.Compose(
@@ -378,6 +379,65 @@ class VJEPA21Wrapper:
         lay = self.layout(num_frames=1)
         feat = stacked.reshape(B, L, lay.grid_h, lay.grid_w, D).permute(0, 1, 4, 2, 3).contiguous()
         return feat.float()
+
+    # ------------------------------------------------------------------
+    # Predictor input projection (a compressed state)
+    # ------------------------------------------------------------------
+    def _load_predictor_embed(self) -> torch.nn.Linear:
+        """Build the predictor's input projection ``predictor_embed`` as a standalone Linear.
+
+        In the pretraining/distillation predictor, ``x = predictor_embed(x)`` is the FIRST
+        op — a linear projection of the encoder output before any masked prediction. For our
+        distilled ViT-B it is a single ``Linear(embed_dim -> predictor_embed_dim)`` (e.g.
+        768 -> 384). The multi-level fusion variant (``Sequential`` over concatenated layers)
+        exists only in deep-supervised teacher checkpoints, which we don't load here.
+        """
+        blob = self._read_checkpoint()
+        if "predictor" not in blob:
+            raise KeyError("checkpoint has no 'predictor' weights; cannot expose predictor_embed")
+        state = self._clean_state_dict(blob["predictor"])
+        w = state.get("predictor_embed.weight")
+        b = state.get("predictor_embed.bias")
+        if w is None or w.ndim != 2:
+            raise RuntimeError(
+                "predictor_embed is not a single Linear in this checkpoint "
+                f"(weight={None if w is None else tuple(w.shape)}). The multi-level fusion MLP "
+                "(a Sequential) only exists in deep-supervised teacher checkpoints (e.g. ViT-G)."
+            )
+        out_dim, in_dim = w.shape
+        lin = torch.nn.Linear(in_dim, out_dim, bias=b is not None)
+        with torch.no_grad():
+            lin.weight.copy_(w)
+            if b is not None:
+                lin.bias.copy_(b)
+        lin = lin.to(self.device).eval()
+        for p in lin.parameters():
+            p.requires_grad_(False)
+        if self.verbose:
+            print(f"[VJEPA21] predictor_embed: Linear({in_dim} -> {out_dim}) loaded")
+        return lin
+
+    @property
+    def predictor_embed_dim(self) -> int:
+        if self._predictor_embed is None:
+            self._predictor_embed = self._load_predictor_embed()
+        return self._predictor_embed.out_features
+
+    @torch.no_grad()
+    def compress_final(self, feat_bdhw: torch.Tensor) -> torch.Tensor:
+        """Project a final-layer feature map through ``predictor_embed``.
+
+        ``feat_bdhw``: ``(B, D, gh, gw)`` final-layer features -> ``(B, D', gh, gw)`` where
+        ``D' = predictor_embed_dim`` (e.g. 768 -> 384). This is the predictor's *compressed
+        input space* for the current frame (NOT a forward-predicted state).
+        """
+        if self._predictor_embed is None:
+            self._predictor_embed = self._load_predictor_embed()
+        lin = self._predictor_embed
+        x = feat_bdhw.to(self.device, lin.weight.dtype)
+        x = x.permute(0, 2, 3, 1)              # (B, gh, gw, D)
+        x = lin(x)                             # (B, gh, gw, D')
+        return x.permute(0, 3, 1, 2).contiguous()  # (B, D', gh, gw)
 
     def encode_images_hierarchical(
         self, images: Union[ImageLike, Sequence[ImageLike]], batch_size: int = 8

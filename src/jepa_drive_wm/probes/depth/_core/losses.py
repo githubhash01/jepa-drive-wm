@@ -149,37 +149,3 @@ class MultiLoss(nn.Module):
 def build_loss(losses: dict[str, float]) -> MultiLoss:
     """Build a MultiLoss from a ``{"SIGLOSS": 1.0}``-style config dict."""
     return MultiLoss({LossType[name]: weight for name, weight in losses.items()})
-
-
-def chamfer_bin_loss(
-    centers: torch.Tensor,
-    depth: torch.Tensor,
-    valid: torch.Tensor,
-    max_depth: float = 80.0,
-    n_sample: int = 512,
-) -> torch.Tensor:
-    """Bi-directional Chamfer distance between predicted bin centers and GT depths (AdaBins).
-
-    Encourages the adaptive bin centers to (a) sit near real depths and (b) collectively
-    cover the depth distribution, so they don't collapse. Distances are computed on
-    depth/max_depth (in [0,1]) for a scale-stable term. ``centers`` (B, n_bins), ``depth``
-    and ``valid`` (B, 1, H, W).
-    """
-    B = centers.shape[0]
-    total = centers.new_zeros(())
-    count = 0
-    c = centers / max_depth  # (B, n_bins) normalised
-    for b in range(B):
-        d = depth[b][valid[b]]
-        if d.numel() == 0:
-            continue
-        d = d / max_depth
-        if d.numel() > n_sample:
-            idx = torch.randint(0, d.numel(), (n_sample,), device=d.device)
-            d = d[idx]
-        dist = (d[:, None] - c[b][None, :]).abs()      # (M, n_bins)
-        gt_to_bin = dist.min(dim=1).values.mean()      # each GT depth -> nearest bin
-        bin_to_gt = dist.min(dim=0).values.mean()      # each bin -> nearest GT depth
-        total = total + gt_to_bin + bin_to_gt
-        count += 1
-    return total / max(count, 1)

@@ -2,3 +2,9 @@
 /dinov3/
 **__pycache__/
 *.log
+
+# build / run artifacts
+*.egg-info/
+wandb/
+# exploratory prototype outputs (real dataset lives under ~/Desktop/Datasets)
+src/jepa_drive_wm/probes/semantics/preds/
