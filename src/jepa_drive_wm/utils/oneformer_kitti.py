@@ -50,7 +50,10 @@ from jepa_drive_wm.probes.dense.taxonomy import (
 )
 
 MODEL_ID = "shi-labs/oneformer_cityscapes_swin_large"
-DATASET_ROOT = Path("/home/hashim/Desktop/Datasets/KITTI/semantic_oneformer")
+# Semantics live inside each sequence folder (sequences/<seq>/semantic_oneformer),
+# alongside image_2/depth/vjepa_vitb. `root` below is the sequences dir.
+from jepa_drive_wm.paths import SEQUENCES_DIR as DATASET_ROOT
+SEMANTICS_DIRNAME = "semantic_oneformer"
 
 # The Cityscapes processor upsamples inputs to a large resolution by default,
 # which OOMs an 8 GB card. KITTI frames are ~1241x376, so cap the shortest edge
@@ -127,7 +130,7 @@ def segment_batch_safe(images, processor, model, device, batch_size):
 
 def seq_out_dir(sequence_nr: int, root: Path = DATASET_ROOT) -> Path:
     """Where the label PNGs for a given sequence live."""
-    return root / f"{sequence_nr:02d}"
+    return root / f"{sequence_nr:02d}" / SEMANTICS_DIRNAME
 
 
 def frame_to_pil(seq: KITTISequence, frame: int) -> Image.Image:

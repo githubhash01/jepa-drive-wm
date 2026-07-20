@@ -7,6 +7,7 @@ responsible for all visualisation of data and results
 
 import numpy as np
 import matplotlib.pyplot as plt
+from jepa_drive_wm.paths import OUTPUTS_DIR
 from jepa_drive_wm.probes.dense.taxonomy import PALETTE, CLASS_TO_GROUP, GROUP_PALETTE, NUM_CLASSES, NUM_GROUPS
 
 
@@ -19,7 +20,9 @@ from jepa_drive_wm.data.global_pca import (
 
 class Visualiser:
 
-    def __init__(self, pca_path: str = "/home/hashim/Desktop/Outputs/vjepa21_global_train_pca.npz") -> None: # TODO - get rid of hardcoded path
+    def __init__(self, pca_path: str | None = None) -> None:
+        if pca_path is None:
+            pca_path = str(OUTPUTS_DIR / "vjepa21_global_train_pca.npz")
         self.pca_path = pca_path
         self._pca_data = None
 

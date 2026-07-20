@@ -43,7 +43,8 @@ from tqdm import tqdm
 from sklearn.decomposition import IncrementalPCA
 from PIL import Image
 import matplotlib.pyplot as plt
-OUT_DIR = "~/Desktop/Outputs"
+from jepa_drive_wm.paths import OUTPUTS_DIR
+OUT_DIR = str(OUTPUTS_DIR)
 
 
 DEFAULT_FIT_SEQUENCES = [0, 1, 2, 4, 5, 6]          # train split: avoid leaking val/test into PCA

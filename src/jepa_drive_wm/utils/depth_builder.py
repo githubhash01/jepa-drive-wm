@@ -18,6 +18,8 @@ import sys
 import time
 from pathlib import Path
 
+from jepa_drive_wm.paths import KITTI_ROOT, FS_ROOT
+
 import cv2
 import numpy as np
 import torch
@@ -221,11 +223,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sequence", type=int, default=4, help="Single sequence to process if --sequences is not set.")
     ap.add_argument("--sequences", type=str, default=None, help="Comma/range list, e.g. '0-21' or '00,02,10'.")
-    ap.add_argument("--kitti_root", default="/home/hashim/Desktop/Datasets/KITTI")
-    ap.add_argument("--fs_root", default="/home/hashim/Modules/FoundationStereo")
+    ap.add_argument("--kitti_root", default=str(KITTI_ROOT))
+    # FoundationStereo is only needed to (re)generate depth pseudolabels — optional
+    # on machines where the depth/ folders already exist.
+    ap.add_argument("--fs_root", default=str(FS_ROOT))
     ap.add_argument(
         "--ckpt",
-        default="/home/hashim/Modules/FoundationStereo/pretrained_models/11-33-40/model_best_bp2.pth",
+        default=str(FS_ROOT / "pretrained_models" / "11-33-40" / "model_best_bp2.pth"),
     )
     ap.add_argument("--z_far", type=float, default=80.0)
     ap.add_argument("--valid_iters", type=int, default=16)

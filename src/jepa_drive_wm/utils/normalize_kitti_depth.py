@@ -30,6 +30,8 @@ import os
 import shutil
 from pathlib import Path
 
+from jepa_drive_wm.paths import KITTI_ROOT
+
 import cv2
 
 
@@ -125,7 +127,7 @@ def normalize_sequence(seq_dir: Path, depth_dirname: str, extra_dirnames: list[s
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kitti_root", default="/home/hashim/Desktop/Datasets/KITTI")
+    ap.add_argument("--kitti_root", default=str(KITTI_ROOT))
     ap.add_argument("--sequences", default="0-21", help="Comma/range list, e.g. '0-21' or '00,02,10'.")
     ap.add_argument("--depth_dirname", default="depth", help="Canonical depth dir to normalise in place.")
     ap.add_argument("--remove_dirnames", default="depth_fast", help="Comma list of stray dirs to delete.")
