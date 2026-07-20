@@ -1,14 +1,14 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
-from jepa_drive_wm.data.kitti import KITTISequence
 import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
 
-
-# KITTI odometry is recorded at 10 Hz.
-KITTI_FRAME_PERIOD = 0.1
+from jepa_drive_wm.data.kitti import KITTISequence
 
 
 class KITTIRolloutDataset(Dataset):
+    # KITTI odometry is recorded at 10 Hz.
+    FRAME_PERIOD = 0.1
+
     def __init__(
         self,
         sequence_numbers: list[int],
@@ -21,10 +21,14 @@ class KITTIRolloutDataset(Dataset):
 
         # KITTI is captured at 10 Hz, so consecutive frames are only 0.1s apart --
         # too fine a step to be an interesting prediction target. The stride
-        # subsamples every window uniformly: step = frame_stride * 0.1s, so the
-        # default of 5 puts 0.5s between each context frame and each future frame.
+        # subsamples every window uniformly: step = frame_stride * FRAME_PERIOD,
+        # so the default of 5 puts 0.5s between consecutive window frames.
+        #
+        # `step_seconds` is the single source of truth for the physical step
+        # duration. Everything downstream (e.g. the action normalisation in
+        # train_wm.py) should read it from here rather than re-deriving it.
         self.frame_stride = frame_stride
-        self.step_seconds = frame_stride * KITTI_FRAME_PERIOD
+        self.step_seconds = frame_stride * self.FRAME_PERIOD
 
         # Keep each sequence available for lazy loading.
         self.sequences = {
@@ -131,6 +135,10 @@ class KITTIRolloutLoaders:
     Splitting by sequence (rather than by window) keeps the splits honest -- windows
     from one sequence overlap far too much to be safely divided between train and
     validation.
+
+    `step_seconds` (the physical duration of one prediction step) is computed once
+    by the datasets and re-exported here. Consumers should take it from this
+    attribute -- never recompute it from frame_stride.
     """
 
     def __init__(
@@ -166,6 +174,7 @@ class KITTIRolloutLoaders:
         self.validation_dataset = KITTIRolloutDataset(validation_sequences, **dataset_kwargs)
         self.test_dataset = KITTIRolloutDataset(test_sequences, **dataset_kwargs)
 
+        # All three datasets share one window configuration, so one step duration.
         self.step_seconds = self.train_dataset.step_seconds
 
         self.train = self._make_loader(self.train_dataset, shuffle=True)

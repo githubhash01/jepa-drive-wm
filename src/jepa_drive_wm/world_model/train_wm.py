@@ -21,17 +21,34 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import wandb
 from jaxtyping import Float
 from torch import Tensor
 
 from jepa_drive_wm.world_model.data_interface_wm import KITTIRolloutLoaders
 from jepa_drive_wm.world_model.model import VJEPA21WorldModel
 
-# TODO - understand wtf is going on here
-# The Fourier action embedder expects inputs in roughly [-0.5, 0.5].
-# At 0.5s steps, KITTI translation per step is at most ~17m (highway); yaw is
-# wrapped to [-pi, pi]. These constants map raw (dx, dy, yaw) into range.
-ACTION_SCALE = torch.tensor([20.0, 20.0, math.pi])
+# Speed ceiling used to normalise per-step translation. Generous for road
+# vehicles (~90 mph); KITTI's fastest highway stretches reach ~34 m/s.
+MAX_SPEED_MPS = 40.0
+
+
+def action_scale(step_seconds: float) -> torch.Tensor:
+    """Per-step normalisation for raw ego motion (dx, dy, yaw).
+
+    The Fourier action embedder (frequencies 2^k * pi) is exactly periodic
+    with period 2 in its input, so inputs outside one period alias onto each
+    other. Dividing translation by (MAX_SPEED_MPS * step_seconds) guarantees
+    |dx|, |dy| <= 1 for any vehicle obeying the speed ceiling -- always within
+    one period, never aliasing -- and typical steps land well inside +-0.5,
+    where the coarsest band is monotonic.
+
+    Yaw is divided by pi, mapping [-pi, pi] onto one full embedding period so
+    the embedding's wraparound coincides with the physical wraparound: a yaw
+    of -pi and +pi (the same rotation) get the same embedding.
+    """
+    max_translation = MAX_SPEED_MPS * step_seconds
+    return torch.tensor([max_translation, max_translation, math.pi])
 
 
 def to_grid(
@@ -96,19 +113,29 @@ def run_epoch(
     model: VJEPA21WorldModel,
     loader,
     device: torch.device,
+    step_seconds: float,
     optimizer: torch.optim.Optimizer | None = None,
     log_every: int = 50,
     tag: str = "train",
-) -> tuple[float, float]:
+    global_step: int = 0,
+) -> tuple[float, float, int]:
     """One pass over a loader. Trains if an optimizer is given, else evaluates.
-    Returns mean (teacher forcing, rollout) losses.
+    Returns mean (teacher forcing, rollout) losses and the updated global step.
+
+    `step_seconds` is the physical duration of one prediction step; take it
+    from KITTIRolloutLoaders.step_seconds rather than recomputing it, so the
+    action normalisation always agrees with the data pipeline. Passing it
+    explicitly also keeps this function working on any iterable of batches
+    (e.g. the smoke test's plain list), not just a DataLoader.
 
     Logs the moment the first batch arrives (so a stalled data pipeline is
     obvious immediately) and a running average every `log_every` steps.
+    Per-batch wandb logging happens only when training; per-epoch logging is
+    the caller's job.
     """
     training = optimizer is not None
     model.train(training)
-    action_scale = ACTION_SCALE.to(device)
+    act_scale = action_scale(step_seconds).to(device)
 
     tf_total, ar_total = 0.0, 0.0
     start = time.time()
@@ -122,7 +149,7 @@ def run_epoch(
         future = to_grid(
             batch["future_latents"].to(device), model.grid_height, model.grid_width
         )
-        ego_motions = batch["future_ego_motions"].to(device) / action_scale
+        ego_motions = batch["future_ego_motions"].to(device) / act_scale
 
         with torch.set_grad_enabled(training):
             tf_preds, ar_preds = forward_predictions(model, context, ego_motions, future)
@@ -133,8 +160,19 @@ def run_epoch(
         if training:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # clip_grad_norm_ returns the pre-clip norm: a free health metric.
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+
+            wandb.log(
+                {
+                    "batch/step": global_step,
+                    "batch/tf": tf_loss.item(),
+                    "batch/ar": ar_loss.item(),
+                    "batch/grad_norm": grad_norm.item(),
+                }
+            )
+            global_step += 1
 
         tf_total += tf_loss.item()
         ar_total += ar_loss.item()
@@ -149,7 +187,7 @@ def run_epoch(
             )
 
     n = max(len(loader), 1)
-    return tf_total / n, ar_total / n
+    return tf_total / n, ar_total / n, global_step
 
 
 def main() -> None:
@@ -168,7 +206,7 @@ def main() -> None:
         action="store_true",
         help="Run a few batches through train+val and exit, to prove the loop.",
     )
-    parser.add_argument("--checkpoint", type=Path, default=Path("world_model.pt"))
+    parser.add_argument("--checkpoint", type=Path, default=Path("/home/hashim/Desktop/jepa-drive-wm/src/jepa_drive_wm/world_model/checkpoints_wm/world_model.pt"))
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,6 +223,27 @@ def main() -> None:
     )
     print(loaders)
 
+    # `disabled` turns every wandb.log below into a no-op during smoke tests.
+    wandb.init(
+        project="jepa-drive-wm",
+        job_type="world_model",
+        config={
+            **vars(args),
+            "checkpoint": str(args.checkpoint),
+            "max_speed_mps": MAX_SPEED_MPS,
+            "step_seconds": loaders.step_seconds,
+        },
+        mode="disabled" if args.smoke_test else "online",
+    )
+    # Epoch metrics plot against `epoch`; batch metrics against their own
+    # counter. Without this, per-batch and per-epoch logs fight over wandb's
+    # global step and the epoch curves come out mangled.
+    wandb.define_metric("epoch")
+    wandb.define_metric("train/*", step_metric="epoch")
+    wandb.define_metric("val/*", step_metric="epoch")
+    wandb.define_metric("batch/step")
+    wandb.define_metric("batch/*", step_metric="batch/step")
+
     model = VJEPA21WorldModel().to(device)
     print(f"parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
@@ -196,21 +255,45 @@ def main() -> None:
         from itertools import islice
 
         few = list(islice(loaders.train, 4))
-        run_epoch(model, few, device, optimizer, log_every=1, tag="smoke")
+        run_epoch(
+            model, few, device, loaders.step_seconds, optimizer, log_every=1, tag="smoke"
+        )
         print("smoke test passed: data loads and a train step runs.")
+        wandb.finish()
         return
 
+    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+
     best_val_ar = float("inf")
+    global_step = 0
     for epoch in range(args.epochs):
-        train_tf, train_ar = run_epoch(
-            model, loaders.train, device, optimizer, log_every=args.log_every, tag="train"
+        train_tf, train_ar, global_step = run_epoch(
+            model,
+            loaders.train,
+            device,
+            loaders.step_seconds,
+            optimizer,
+            log_every=args.log_every,
+            tag="train",
+            global_step=global_step,
         )
-        val_tf, val_ar = run_epoch(model, loaders.validation, device, log_every=0, tag="val")
+        val_tf, val_ar, _ = run_epoch(
+            model, loaders.validation, device, loaders.step_seconds, log_every=0, tag="val"
+        )
 
         print(
             f"epoch {epoch:3d} | "
             f"train tf {train_tf:.4f} ar {train_ar:.4f} | "
             f"val tf {val_tf:.4f} ar {val_ar:.4f}"
+        )
+        wandb.log(
+            {
+                "epoch": epoch,
+                "train/tf": train_tf,
+                "train/ar": train_ar,
+                "val/tf": val_tf,
+                "val/ar": val_ar,
+            }
         )
 
         # The rollout loss is the one that matters for navigation, so it
@@ -218,10 +301,22 @@ def main() -> None:
         if val_ar < best_val_ar:
             best_val_ar = val_ar
             torch.save(
-                {"model": model.state_dict(), "epoch": epoch, "val_ar": val_ar},
+                {
+                    "model": model.state_dict(),
+                    "epoch": epoch,
+                    "val_ar": val_ar,
+                    # The action normalisation is part of the model contract:
+                    # inference must divide raw ego motion by the same scale.
+                    "max_speed_mps": MAX_SPEED_MPS,
+                    "step_seconds": loaders.step_seconds,
+                },
                 args.checkpoint,
             )
+            wandb.summary["best_val_ar"] = val_ar
+            wandb.summary["best_epoch"] = epoch
             print(f"          saved checkpoint (val ar {val_ar:.4f})")
+
+    wandb.finish()
 
 
 if __name__ == "__main__":

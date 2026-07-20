@@ -190,9 +190,37 @@ def chunks(seq, n):
         yield seq[i : i + n]
 
 
+
+def parse_sequences(spec: str) -> list[int]:
+    """Parse comma/range sequence specs like '0-21', '00,02,10', or '0-10,13'."""
+    out: list[int] = []
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            a, b = part.split('-', 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    # preserve order, remove duplicates
+    seen = set()
+    seqs = []
+    for s in out:
+        if s < 0 or s > 21:
+            raise ValueError(f"KITTI odometry sequence out of expected range 00-21: {s}")
+        if s not in seen:
+            seen.add(s)
+            seqs.append(s)
+    if not seqs:
+        raise ValueError(f"No sequences parsed from: {spec!r}")
+    return seqs
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sequence", type=int, default=4)
+    ap.add_argument("--sequence", type=int, default=4, help="Single sequence to process if --sequences is not set.")
+    ap.add_argument("--sequences", type=str, default=None, help="Comma/range list, e.g. '0-21' or '00,02,10'.")
     ap.add_argument("--kitti_root", default="/home/hashim/Desktop/Datasets/KITTI")
     ap.add_argument("--fs_root", default="/home/hashim/Modules/FoundationStereo")
     ap.add_argument(
@@ -218,26 +246,10 @@ def main():
 
     setup_torch_speed_knobs()
 
-    seq_dir = Path(args.kitti_root) / f"data_odometry_color/dataset/sequences/{args.sequence:02d}"
-    left_dir = seq_dir / "image_2"
-    right_dir = seq_dir / "image_3"
-    k_path = seq_dir / "K.txt"
-    depth_dir = seq_dir / args.depth_dirname
-    depth_dir.mkdir(parents=True, exist_ok=True)
+    sequences = parse_sequences(args.sequences) if args.sequences is not None else [args.sequence]
+    print(f"Sequences: {', '.join(f'{s:02d}' for s in sequences)}")
 
-    if not k_path.exists():
-        raise FileNotFoundError(f"{k_path} not found. Run write_foundationstereo_intrinsics first.")
-
-    frame_ids = sorted(p.stem for p in left_dir.glob("*.png"))
-    if args.max_frames > 0:
-        frame_ids = frame_ids[: args.max_frames]
-    if not frame_ids:
-        raise FileNotFoundError(f"No frames found in {left_dir}")
-
-    K, baseline = read_intrinsics(k_path)
-    print(f"Sequence {args.sequence:02d}: {len(frame_ids)} frames -> {depth_dir}")
-    print(f"fx={K[0,0]:.3f} baseline={baseline:.4f}m scale={args.scale} iters={args.valid_iters} batch={args.batch_size}")
-
+    # Build the model once and reuse it across all KITTI sequences.
     model = build_model(
         Path(args.fs_root),
         Path(args.ckpt),
@@ -245,56 +257,97 @@ def main():
         compile_model=args.compile,
     )
 
-    work = []
-    for fid in frame_ids:
-        out_path = depth_dir / f"{fid}.png"
-        if out_path.exists() and not args.overwrite:
+    total_start = time.perf_counter()
+    total_done = 0
+    total_skipped_existing = 0
+
+    for seq in sequences:
+        seq_dir = Path(args.kitti_root) / f"data_odometry_color/dataset/sequences/{seq:02d}"
+        left_dir = seq_dir / "image_2"
+        right_dir = seq_dir / "image_3"
+        k_path = seq_dir / "K.txt"
+        depth_dir = seq_dir / args.depth_dirname
+        depth_dir.mkdir(parents=True, exist_ok=True)
+
+        if not k_path.exists():
+            raise FileNotFoundError(f"{k_path} not found. Run write_foundationstereo_intrinsics first.")
+
+        frame_ids = sorted(p.stem for p in left_dir.glob("*.png"))
+        if args.max_frames > 0:
+            frame_ids = frame_ids[: args.max_frames]
+        if not frame_ids:
+            raise FileNotFoundError(f"No frames found in {left_dir}")
+
+        K, baseline = read_intrinsics(k_path)
+        print(f"\nSequence {seq:02d}: {len(frame_ids)} frames -> {depth_dir}")
+        print(f"fx={K[0,0]:.3f} baseline={baseline:.4f}m scale={args.scale} iters={args.valid_iters} batch={args.batch_size}")
+
+        work = []
+        skipped_existing = 0
+        for fid in frame_ids:
+            out_path = depth_dir / f"{fid}.png"
+            if out_path.exists() and not args.overwrite:
+                skipped_existing += 1
+                continue
+            left_path = left_dir / f"{fid}.png"
+            right_path = right_dir / f"{fid}.png"
+            if not right_path.exists():
+                print(f"  skip {fid}: missing right image")
+                continue
+            work.append((fid, left_path, right_path, out_path))
+
+        total_skipped_existing += skipped_existing
+        print(f"Frames to process: {len(work)}  already existed: {skipped_existing}")
+        if not work:
             continue
-        left_path = left_dir / f"{fid}.png"
-        right_path = right_dir / f"{fid}.png"
-        if not right_path.exists():
-            print(f"  skip {fid}: missing right image")
-            continue
-        work.append((fid, left_path, right_path, out_path))
 
-    print(f"Frames to process: {len(work)}")
-    t_start = time.perf_counter()
-    done = 0
+        seq_start = time.perf_counter()
+        done = 0
 
-    for batch_items in chunks(work, args.batch_size):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        for batch_items in chunks(work, args.batch_size):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-        depths = infer_depth_batch(
-            model,
-            batch_items,
-            K,
-            baseline,
-            args.scale,
-            args.valid_iters,
-            args.z_far,
-            save_full_res=args.save_full_res,
-            channels_last=args.channels_last,
-            amp_dtype=args.amp_dtype,
-        )
-        for depth, (_, _, _, out_path) in zip(depths, batch_items):
-            save_depth_png(depth, out_path, args.png_compression)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        dt = time.perf_counter() - t0
-        done += len(batch_items)
-
-        if done == len(batch_items) or done % 20 == 0 or done >= len(work):
-            elapsed = time.perf_counter() - t_start
-            print(
-                f"  {batch_items[-1][0]}  batch {dt:.2f}s, {dt/len(batch_items):.2f}s/frame "
-                f"({done} done, avg {elapsed/max(done,1):.2f}s/frame)"
+            depths = infer_depth_batch(
+                model,
+                batch_items,
+                K,
+                baseline,
+                args.scale,
+                args.valid_iters,
+                args.z_far,
+                save_full_res=args.save_full_res,
+                channels_last=args.channels_last,
+                amp_dtype=args.amp_dtype,
             )
+            for depth, (_, _, _, out_path) in zip(depths, batch_items):
+                save_depth_png(depth, out_path, args.png_compression)
 
-    elapsed = time.perf_counter() - t_start
-    print(f"Finished {done} frames in {elapsed:.1f}s ({elapsed/max(done,1):.2f}s/frame)")
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
+            done += len(batch_items)
+            total_done += len(batch_items)
+
+            if done == len(batch_items) or done % 20 == 0 or done >= len(work):
+                seq_elapsed = time.perf_counter() - seq_start
+                total_elapsed = time.perf_counter() - total_start
+                print(
+                    f"  seq{seq:02d}/{batch_items[-1][0]}  batch {dt:.2f}s, {dt/len(batch_items):.2f}s/frame "
+                    f"({done}/{len(work)} seq, {total_done} total, "
+                    f"seq avg {seq_elapsed/max(done,1):.2f}s/frame, total avg {total_elapsed/max(total_done,1):.2f}s/frame)"
+                )
+
+        seq_elapsed = time.perf_counter() - seq_start
+        print(f"Sequence {seq:02d} finished {done} frames in {seq_elapsed:.1f}s ({seq_elapsed/max(done,1):.2f}s/frame)")
+
+    total_elapsed = time.perf_counter() - total_start
+    print(
+        f"\nFinished all requested sequences: wrote {total_done} frames, "
+        f"skipped existing {total_skipped_existing}, elapsed {total_elapsed:.1f}s "
+        f"({total_elapsed/max(total_done,1):.2f}s/frame over written frames)"
+    )
 
 
 if __name__ == "__main__":
