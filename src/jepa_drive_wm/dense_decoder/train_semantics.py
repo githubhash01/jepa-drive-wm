@@ -19,6 +19,7 @@ import wandb
 
 from jepa_drive_wm.dense_decoder.data_interface_dense import KITTIDenseLoaders
 from jepa_drive_wm.dense_decoder.model_semantics import SemanticDecoder
+from jepa_drive_wm.paths import OUTPUTS_DIR
 
 # ----------------------------------------------------------------------------- config
 
@@ -35,7 +36,7 @@ TRAIN_SEQUENCES = [0, 1, 2, 3, 5, 6, 8]
 VALIDATION_SEQUENCES = [7, 10]
 TEST_SEQUENCES = [4, 9]
 
-CHECKPOINT_PATH = Path("/home/hashim/Desktop/jepa-drive-wm/src/jepa_drive_wm/dense_decoder/checkpoints_semantics/semantic_decoder_best.pt")
+CHECKPOINT_PATH = OUTPUTS_DIR / "checkpoints_semantics" / "semantic_decoder_best.pt"
 
 
 # ----------------------------------------------------------------------------- model io

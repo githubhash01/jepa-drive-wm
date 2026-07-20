@@ -1,0 +1,32 @@
+# Curated runtime dependencies for jepa-drive-wm, pinned to the versions in the
+# working laptop env (vjepa2_env, Python 3.12.13). Full `pip freeze` of that env
+# is in docs/env_freeze.txt as a fallback reference.
+#
+# torch / torchvision are listed here at the working versions, but on a new
+# machine install them FIRST from the index matching the local CUDA, e.g.:
+#     pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
+# (laptop build was CUDA 13.0), then `pip install -r requirements.txt` will
+# see them satisfied and not touch them.
+torch==2.11.0
+torchvision==0.26.0
+
+numpy==2.4.4
+pillow==12.2.0
+matplotlib==3.10.9
+tqdm==4.67.3
+scipy==1.17.1
+scikit-learn==1.8.0          # global_pca (IncrementalPCA)
+opencv-python==4.13.0.92     # depth_builder / normalize_kitti_depth
+jaxtyping==0.3.11            # train_wm type annotations
+wandb==0.26.1
+
+# V-JEPA 2.1 encoder (vendored vjepa2/ repo) needs these at import time:
+timm==1.0.27
+einops==0.8.2
+
+# OneFormer pseudolabel generation (utils/oneformer_kitti.py):
+transformers==5.8.0
+
+# depth_builder additionally needs `omegaconf` (+ a FoundationStereo checkout),
+# which is NOT in vjepa2_env — depth pseudolabels were generated in a separate
+# FoundationStereo environment and are already built, so it is not listed here.

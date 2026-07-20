@@ -32,7 +32,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from vjepa_wrapper import VJEPA21Size, VJEPA21Wrapper
+from jepa_drive_wm.paths import KITTI_ROOT
+from jepa_drive_wm.utils.vjepa_wrapper import VJEPA21Size, VJEPA21Wrapper
 
 
 def parse_sequences(spec: str) -> list[int]:
@@ -70,7 +71,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sequence", type=int, default=0, help="Single sequence if --sequences is not set.")
     ap.add_argument("--sequences", type=str, default=None, help="Comma/range list, e.g. '0-21' or '00,02,10'.")
-    ap.add_argument("--kitti_root", default="/home/hashim/Desktop/Datasets/KITTI")
+    ap.add_argument("--kitti_root", default=str(KITTI_ROOT))
     ap.add_argument("--image_dirname", default="image_2", help="Which camera folder to embed.")
     ap.add_argument("--out_dirname", default=None,
                     help="Cache folder created inside each sequence. Defaults to "

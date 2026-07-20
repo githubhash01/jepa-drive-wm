@@ -25,6 +25,7 @@ import wandb
 from jaxtyping import Float
 from torch import Tensor
 
+from jepa_drive_wm.paths import OUTPUTS_DIR
 from jepa_drive_wm.world_model.data_interface_wm import KITTIRolloutLoaders
 from jepa_drive_wm.world_model.model import VJEPA21WorldModel
 
@@ -206,7 +207,7 @@ def main() -> None:
         action="store_true",
         help="Run a few batches through train+val and exit, to prove the loop.",
     )
-    parser.add_argument("--checkpoint", type=Path, default=Path("/home/hashim/Desktop/jepa-drive-wm/src/jepa_drive_wm/world_model/checkpoints_wm/world_model.pt"))
+    parser.add_argument("--checkpoint", type=Path, default=OUTPUTS_DIR / "checkpoints_wm" / "world_model.pt")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

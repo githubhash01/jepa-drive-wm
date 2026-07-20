@@ -6,8 +6,7 @@ from PIL import Image
 import pathlib
 
 
-SEQUENCES_DIR = pathlib.Path("/home/hashim/Desktop/Datasets/KITTI/data_odometry_color/dataset/sequences")
-GT_POSES_DIR = pathlib.Path("/home/hashim/Desktop/Datasets/KITTI/data_odometry_poses/dataset/poses")
+from jepa_drive_wm.paths import SEQUENCES_DIR, GT_POSES_DIR
 
 # OneFormer Cityscapes semantic label maps now live inside each sequence folder
 # (see scripts/reorg_semantics.py), alongside image_2/depth/vjepa_vitb.

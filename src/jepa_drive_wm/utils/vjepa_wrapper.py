@@ -39,9 +39,8 @@ import torch
 import numpy as np
 from torchvision import transforms
 
-# Hardcoded local paths — keep it simple.
-VJEPA_REPO = "/home/hashim/Modules/vjepa2"
-VJEPA_CHECKPOINTS_DIR = "/home/hashim/Modules/model_checkpoints/vjepa21"
+# Central path config (env-var overridable, defaults to the vendored checkout).
+from jepa_drive_wm.paths import VJEPA_REPO, VJEPA_CKPT_DIR as VJEPA_CHECKPOINTS_DIR
 
 # Import locations inside the V-JEPA2 repo. Kept in one place so a repo
 # re-organisation costs you exactly two lines.
