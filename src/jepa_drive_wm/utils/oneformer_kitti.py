@@ -131,7 +131,7 @@ def seq_out_dir(sequence_nr: int, root: Path = DATASET_ROOT) -> Path:
 
 
 def frame_to_pil(seq: KITTISequence, frame: int) -> Image.Image:
-    img = (seq.load_image(frame) * 255).astype(np.uint8)  # (H, W, 3) in [0,1] -> uint8
+    img = (seq.get_image(frame) * 255).astype(np.uint8)  # (H, W, 3) in [0,1] -> uint8
     return Image.fromarray(img)
 
 

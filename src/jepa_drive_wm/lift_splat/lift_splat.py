@@ -2,23 +2,17 @@
 Lifts and Splats FV to BEV
 
 
-Given FV-RGB or FV-VJEPA features:
+Given FV-RGB 
 
 - Lift: project each valid pixel/feature into 3D space using the depth map and camera intrinsics
 
-        (u, v, RGB) -> (x, y, z, RGB) or (u, v, VJEPA) -> (x, y, z, VJEPA)
+        (u, v, RGB) -> (x, y, z, RGB) 
 
 - Splat: project the 3D points into the BEV plane and accumulate features into a BEV grid
 
-        (x, y, z, RGB) -> (X, Z, RGB) or (x, y, z, VJEPA) -> (X, Z, VJEPA)
+        (x, y, z, RGB) -> (X, Z, RGB) 
 
-Design note:
-    There is not really an "RGB lifter" and a "V-JEPA lifter". There is ONE geometric
-    lifter (this base class) and the subclasses only decide what value rides along with
-    each lifted 3D point. RGB attaches a pixel colour; V-JEPA attaches the feature of
-    the patch that contains the pixel. The geometry is identical.
-
-KITTI camera convention used throughout: x = right, y = down, z = forward.
+Camera convention used throughout: x = right, y = down, z = forward.
 BEV grid uses (x, z); y is only used for height filtering.
 """
 
@@ -173,131 +167,5 @@ class LiftSplat:
         mask = counts > 0
         return bev, counts, mask
 
-class LiftSplatRGB(LiftSplat):
-    """My values are RGB pixels."""
-
-    def lift_splat(self, image, depth, splat_mode: str = "top"):
-        image = torch.as_tensor(np.asarray(image))
-        image = image.float() / 255.0 if image.dtype == torch.uint8 else image.float()
-        return self._lift_splat(
-            depth,
-            lambda us, vs: image[vs, us],
-            splat_mode=splat_mode,
-        )
 
 
-class LiftSplatVJEPA(LiftSplat):
-    """
-    Two distinct V-JEPA lifting strategies — call the one you want explicitly.
-
-        lift_splat_pixels_with_patch_tokens  (dense)
-            Every valid depth pixel is lifted into 3D. Each pixel inherits the
-            feature of whichever V-JEPA patch contains it. Good for filling the BEV.
-            Odd note: the same patch token gets copied across all its pixels.
-
-        lift_splat_patch_tokens  (sparse, conceptually clean)
-            Each V-JEPA patch becomes exactly one 3D point. The patch-centre ray
-            is back-projected at the median depth within that patch. No feature is
-            ever duplicated; each token appears at most once in the BEV.
-    """
-
-    def lift_splat_pixels_with_patch_tokens(
-        self,
-        features: torch.Tensor,
-        depth: torch.Tensor,
-        grid_hw: tuple[int, int] = (24, 78),
-    ):
-        """
-        Dense V-JEPA splat: many pixels → many 3D points, each carrying its patch's feature.
-
-            features: (num_patches, D) V-JEPA patch tokens.
-            depth:    (H0, W0) metric depth, same resolution as the original image.
-            grid_hw:  (grid_h, grid_w) V-JEPA patch grid.
-        Returns (bev_features (H_bev, W_bev, D), counts, observed_mask).
-        """
-        features = torch.as_tensor(features)
-        depth = torch.as_tensor(depth, dtype=torch.float32)
-        H0, W0 = depth.shape
-        grid_h, grid_w = grid_hw
-
-        def gather(us, vs):
-            # Map pixel (u,v) -> patch index. patch_size cancels: idx = floor(px * grid / image).
-            pu = (us.float() * grid_w / W0).floor().long().clamp(0, grid_w - 1)
-            pv = (vs.float() * grid_h / H0).floor().long().clamp(0, grid_h - 1)
-            return features[pv * grid_w + pu]
-
-        return self._lift_splat(depth, gather)
-
-    def lift_splat_patch_tokens(
-        self,
-        features: torch.Tensor,
-        depth: torch.Tensor,
-        grid_hw: tuple[int, int] = (24, 78),
-    ):
-        """
-        Sparse V-JEPA splat: one 3D point per patch → each token appears at most once in BEV.
-        The patch-centre ray is back-projected at the median depth within the patch footprint.
-        Patches with no valid depth are skipped entirely.
-
-            features: (num_patches, D) V-JEPA patch tokens.
-            depth:    (H0, W0) metric depth, same resolution as the original image.
-            grid_hw:  (grid_h, grid_w) V-JEPA patch grid.
-        Returns (bev_features (H_bev, W_bev, D), counts, observed_mask).
-        """
-        features = torch.as_tensor(features, dtype=torch.float32)
-        depth = torch.as_tensor(depth, dtype=torch.float32)
-        H0, W0 = depth.shape
-        grid_h, grid_w = grid_hw
-
-        fx, fy = self.K_image[0, 0], self.K_image[1, 1]
-        cx, cy = self.K_image[0, 2], self.K_image[1, 2]
-
-        patch_h = H0 / grid_h  # patch footprint in original-image pixels (float ok)
-        patch_w = W0 / grid_w
-
-        points_list, feature_list = [], []
-
-        for pv in range(grid_h):
-            for pu in range(grid_w):
-                # Pixel bounds of this patch in the original image.
-                r0 = int(pv * patch_h);       r1 = min(int((pv + 1) * patch_h), H0)
-                c0 = int(pu * patch_w);       c1 = min(int((pu + 1) * patch_w), W0)
-
-                patch_depth = depth[r0:r1, c0:c1]
-                valid = patch_depth > 0
-                if not valid.any():
-                    continue
-
-                # Median depth of valid pixels inside this patch.
-                z = float(patch_depth[valid].median())
-
-                # Back-project the patch-centre ray.
-                u_c = (c0 + c1) / 2.0
-                v_c = (r0 + r1) / 2.0
-                x = (u_c - float(cx)) * z / float(fx)
-                y = (v_c - float(cy)) * z / float(fy)
-
-                points_list.append(torch.tensor([x, y, z]))
-                feature_list.append(features[pv * grid_w + pu])
-
-        if not points_list:
-            D = features.shape[1]
-            empty = torch.zeros(self.bev_height, self.bev_width, D)
-            empty_counts = torch.zeros(self.bev_height, self.bev_width)
-            return empty, empty_counts, empty_counts > 0
-
-        points = torch.stack(points_list)          # (num_valid_patches, 3)
-        values = torch.stack(feature_list)         # (num_valid_patches, D)
-
-        keep = self._filter(points)
-        if not keep.any():
-            D = features.shape[1]
-            empty = torch.zeros(self.bev_height, self.bev_width, D)
-            empty_counts = torch.zeros(self.bev_height, self.bev_width)
-            return empty, empty_counts, empty_counts > 0
-
-        cells = self._to_cells(points[keep])
-        bev, counts = self._splat(cells, values[keep])
-        mask = counts > 0
-        return bev, counts, mask
-    
