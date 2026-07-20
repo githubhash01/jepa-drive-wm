@@ -193,7 +193,7 @@ def run_epoch(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the VJEPA2.1 world model")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--context-length", type=int, default=4)
