@@ -11,8 +11,7 @@ class SemanticDecoder(nn.Module):
         self.semantic_model = nn.Sequential(
             FinalFeatureDPT(
                 embed_dim=embed_dim,
-                output_channels=256,
-                use_input_batchnorm=False,
+                output_channels=19 
             )
         )
         
