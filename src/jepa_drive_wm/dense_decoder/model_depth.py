@@ -13,8 +13,7 @@ class DepthDecoder(nn.Module):
         self.depth_model = nn.Sequential(
             FinalFeatureDPT(
                 embed_dim=embed_dim,
-                output_channels=256,
-                use_input_batchnorm=False,
+                output_channels=256
             ),
             FeaturesToDepth(
                 min_depth=0.5,

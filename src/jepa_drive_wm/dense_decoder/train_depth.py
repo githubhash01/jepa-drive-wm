@@ -53,7 +53,7 @@ TRAIN_SEQUENCES = [0, 1, 2, 3, 5, 6, 8]
 VALIDATION_SEQUENCES = [7, 10]
 TEST_SEQUENCES = [4, 9]
 
-CHECKPOINT_PATH = Path("/home/hashim/Desktop/jepa-drive-wm/src/jepa_drive_wm/dense_decoder/checkpoints/depth_decoder_best.pt")
+CHECKPOINT_PATH = Path("/home/hashim/Desktop/jepa-drive-wm/src/jepa_drive_wm/dense_decoder/checkpoints_depth/depth_decoder_best.pt")
 
 
 # ----------------------------------------------------------------------------- losses
