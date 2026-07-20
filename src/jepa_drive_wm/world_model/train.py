@@ -16,6 +16,7 @@ two losses (also as in VJEPA2-AC, where z_ar starts from z_tf's first frame).
 
 import argparse
 import math
+import time
 from pathlib import Path
 
 import torch
@@ -26,7 +27,7 @@ from torch import Tensor
 from jepa_drive_wm.world_model.data_interface_wm import KITTIRolloutLoaders
 from jepa_drive_wm.world_model.model import VJEPA21WorldModel
 
-
+# TODO - understand wtf is going on here
 # The Fourier action embedder expects inputs in roughly [-0.5, 0.5].
 # At 0.5s steps, KITTI translation per step is at most ~17m (highway); yaw is
 # wrapped to [-pi, pi]. These constants map raw (dx, dy, yaw) into range.
@@ -96,38 +97,56 @@ def run_epoch(
     loader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
+    log_every: int = 50,
+    tag: str = "train",
 ) -> tuple[float, float]:
     """One pass over a loader. Trains if an optimizer is given, else evaluates.
     Returns mean (teacher forcing, rollout) losses.
+
+    Logs the moment the first batch arrives (so a stalled data pipeline is
+    obvious immediately) and a running average every `log_every` steps.
     """
     training = optimizer is not None
     model.train(training)
     action_scale = ACTION_SCALE.to(device)
 
     tf_total, ar_total = 0.0, 0.0
-    with torch.set_grad_enabled(training):
-        for batch in loader:
-            context = to_grid(
-                batch["context_latents"].to(device), model.grid_height, model.grid_width
-            )
-            future = to_grid(
-                batch["future_latents"].to(device), model.grid_height, model.grid_width
-            )
-            ego_motions = batch["future_ego_motions"].to(device) / action_scale
+    start = time.time()
+    for step, batch in enumerate(loader):
+        if step == 0:
+            print(f"  [{tag}] first batch in {time.time() - start:.1f}s", flush=True)
 
+        context = to_grid(
+            batch["context_latents"].to(device), model.grid_height, model.grid_width
+        )
+        future = to_grid(
+            batch["future_latents"].to(device), model.grid_height, model.grid_width
+        )
+        ego_motions = batch["future_ego_motions"].to(device) / action_scale
+
+        with torch.set_grad_enabled(training):
             tf_preds, ar_preds = forward_predictions(model, context, ego_motions, future)
             tf_loss = latent_loss(tf_preds, future)
             ar_loss = latent_loss(ar_preds, future)
             loss = tf_loss + ar_loss
 
-            if training:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-            tf_total += tf_loss.item()
-            ar_total += ar_loss.item()
+        tf_total += tf_loss.item()
+        ar_total += ar_loss.item()
+
+        if log_every and (step + 1) % log_every == 0:
+            rate = (step + 1) / (time.time() - start)
+            print(
+                f"  [{tag}] step {step + 1}/{len(loader)} | "
+                f"tf {tf_total / (step + 1):.4f} ar {ar_total / (step + 1):.4f} | "
+                f"{rate:.1f} it/s",
+                flush=True,
+            )
 
     n = max(len(loader), 1)
     return tf_total / n, ar_total / n
@@ -143,6 +162,12 @@ def main() -> None:
     parser.add_argument("--future-length", type=int, default=2)
     parser.add_argument("--frame-stride", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run a few batches through train+val and exit, to prove the loop.",
+    )
     parser.add_argument("--checkpoint", type=Path, default=Path("world_model.pt"))
     args = parser.parse_args()
 
@@ -167,10 +192,20 @@ def main() -> None:
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
+    if args.smoke_test:
+        from itertools import islice
+
+        few = list(islice(loaders.train, 4))
+        run_epoch(model, few, device, optimizer, log_every=1, tag="smoke")
+        print("smoke test passed: data loads and a train step runs.")
+        return
+
     best_val_ar = float("inf")
     for epoch in range(args.epochs):
-        train_tf, train_ar = run_epoch(model, loaders.train, device, optimizer)
-        val_tf, val_ar = run_epoch(model, loaders.validation, device)
+        train_tf, train_ar = run_epoch(
+            model, loaders.train, device, optimizer, log_every=args.log_every, tag="train"
+        )
+        val_tf, val_ar = run_epoch(model, loaders.validation, device, log_every=0, tag="val")
 
         print(
             f"epoch {epoch:3d} | "

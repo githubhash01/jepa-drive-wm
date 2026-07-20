@@ -44,7 +44,23 @@ GROUPS = [
     ("sky / ignore",    (120, 190, 240)),  # 4
 ]
 GROUP_NAMES = [name for name, _ in GROUPS]
-GROUP_PALETTE = np.array([c for _, c in GROUPS], dtype=np.uint8)
+# GROUP_PALETTE = np.array([c for _, c in GROUPS], dtype=np.uint8)
+
+# Make the colours more visually distinct: 
+
+# drivable: dark grey 
+# soft-drivable: light grey 
+# static obstacle: dark blue
+# dynamic object: dark red
+# sky / ignore: light blue
+GROUP_PALETTE = np.array([
+    ( 80,  80,  80),   # drivable
+    (200, 200, 200),   # soft-drivable
+    (  0,   0, 150),   # static obstacle
+    (150,   0,   0),   # dynamic object
+    (150, 200, 255),   # sky / ignore
+], dtype=np.uint8)
+
 NUM_GROUPS = len(GROUPS)
 
 _DRIVABLE, _SOFT, _STATIC, _DYNAMIC, _SKY = 0, 1, 2, 3, 4

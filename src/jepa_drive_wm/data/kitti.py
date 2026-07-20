@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -8,6 +9,16 @@ import pathlib
 SEQUENCES_DIR = pathlib.Path("/home/hashim/Desktop/Datasets/KITTI/data_odometry_color/dataset/sequences")
 GT_POSES_DIR = pathlib.Path("/home/hashim/Desktop/Datasets/KITTI/data_odometry_poses/dataset/poses")
 
+# OneFormer Cityscapes semantic label maps now live inside each sequence folder
+# (see scripts/reorg_semantics.py), alongside image_2/depth/vjepa_vitb.
+SEMANTICS_DIRNAME = "semantic_oneformer"
+
+# V-JEPA 2.1 ViT-B cache written by utils/vjepa_embeddings_builder.py, one .npy per
+# frame inside each sequence folder. The grid/dim below are only fallbacks for when
+# the cache has no _metadata.json; they match a 384x1248 input at patch size 16.
+VJEPA_BASE_DIRNAME = "vjepa_vitb"
+VJEPA_BASE_GRID_HW = (24, 78)
+VJEPA_BASE_EMBED_DIM = 768
 
 def se3_inverse(T: torch.Tensor) -> torch.Tensor:
     """Inverse of a (4, 4) rigid transform, using R^T instead of a general inverse."""
@@ -90,6 +101,8 @@ KITTI Sequence Object:
 - left_images:       list[str] paths to image_2 frames  (frame c2)
 - right_images:      list[str] paths to image_3 frames  (frame c3)
 - depths:            list[str] paths to depth maps       (in c2, FoundationStereo)
+- vjepa_base_latents: list[str] paths to per-frame V-JEPA 2.1 ViT-B token grids
+- vjepa_grid_hw:     (grid_h, grid_w) token lattice those latents unflatten onto
 - gt_poses:          (N, 4, 4) T_w_c0[i]  -- poses of the REFERENCE camera c0, not c2
 - P2_rect:           (3, 4)    projection matrix for image_2 (left colour)
 - P3_rect:           (3, 4)    projection matrix for image_3 (right colour)
@@ -108,17 +121,18 @@ class KITTISequence:
         self.sequence_folder = SEQUENCES_DIR / f"{sequence_nr:02d}"
 
         self.times: np.ndarray = self._load_times()
+        self.nr_frames: int = len(self.times)
         self.left_images: list[str] = self._load_left_images()
         self.right_images: list[str] = [p.replace("image_2", "image_3") for p in self.left_images]
         self.depths: list[str] = [p.replace("image_2", "depth") for p in self.left_images]
-
+        self.vjepa_base_latents: list[str] = self._load_vjepa_base_latents()
         self.gt_poses: torch.Tensor = self._load_gt_poses()        # T_w_c0[i]
 
         # Raw projection matrices, then everything derived lives on the calib object.
         self.P2_rect, self.P3_rect = self._load_calibration()
         self.calib = KITTICalibration(self.P2_rect, self.P3_rect)
 
-    def load_image(self, i: int) -> np.ndarray:
+    def get_image(self, i: int) -> np.ndarray:
         """Load the left colour image at frame i as a numpy array (H, W, 3) in [0, 1]."""
         path = self.left_images[i]
         img = plt.imread(path)
@@ -126,7 +140,7 @@ class KITTISequence:
             img = img.astype(np.float32) / 255.0
         return img
     
-    def load_depth(self, i: int) -> np.ndarray:
+    def get_depth(self, i: int) -> np.ndarray:
         """Load the depth map at frame i as a numpy array (H, W) in metres."""
         path = self.depths[i]
         if path.endswith(".npy"):
@@ -139,6 +153,82 @@ class KITTISequence:
         if depth.dtype == np.uint16:
             depth = depth.astype(np.float32) / 256.0
         return depth.astype(np.float32, copy=False)
+    
+    def get_ego_motion(self, i: int, j: int) -> np.ndarray:
+        """
+        Ego motion from frame i to frame j as [forward, left, yaw], in metres and
+        radians, expressed in the left camera's frame at time i: "from where the car
+        is at i, it travels `forward` ahead and `left` sideways, turning by `yaw`".
+        get_ego_motion(i, i) is zero.
+
+        KITTI's rectified camera axes are x=right, y=down, z=forward, so the vehicle
+        ground plane is spanned by z and -x, and vehicle yaw is rotation about -y.
+        The returned triple is therefore the usual right-handed vehicle convention,
+        with yaw positive for a left turn.
+        """
+        # T_c2i_c2j maps points from frame j into frame i, so its translation column
+        # is where the camera at time j sits as seen from time i -- the displacement
+        # actually travelled. get_camera_se3(i, j) is the inverse of that.
+        T_c2i_c2j = self.get_camera_se3(j, i).numpy()
+
+        forward = T_c2i_c2j[2, 3]
+        left = -T_c2i_c2j[0, 3]
+        # Rotation about the camera's y (down) axis, negated so left turns are positive.
+        yaw = -np.arctan2(T_c2i_c2j[0, 2], T_c2i_c2j[2, 2])
+        return np.array([forward, left, yaw], dtype=np.float32)
+
+    def get_camera_se3(self, i: int, j: int) -> torch.Tensor:
+        """
+        Left-camera (image_2 / c2) motion from frame i to frame j as a (4, 4)
+        SE(3) transform T_c2j_c2i: it maps a point in the left camera at time i
+        into the left camera at time j (equivalently, the transform to warp
+        image_2 from i to j). get_motion(i, i) is the identity.
+        """
+        return self.relative_left_color_pose(i, j)
+
+    def get_semantics(self, i: int) -> np.ndarray:
+        """
+        Load the OneFormer Cityscapes semantic label map at frame i as a (H, W)
+        int64 array of class ids (0..18), produced by utils/oneformer_kitti.py
+        and saved under <sequence>/semantic_oneformer/<frame>.png.
+        """
+        path = self.sequence_folder / SEMANTICS_DIRNAME / f"{i:06d}.png"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"No saved semantics at {path}. Run "
+                f"`python -m jepa_drive_wm.utils.oneformer_kitti build --seq {self.sequence_nr}`, "
+                f"then `python scripts/reorg_semantics.py --apply` to consolidate."
+            )
+        return np.asarray(Image.open(path)).astype(np.int64)
+
+    def get_vjepa_features(self, i: int, as_grid: bool = False,
+                           dtype: np.dtype = np.float32) -> np.ndarray:
+        """
+        Load the cached V-JEPA 2.1 ViT-B token embedding for frame i.
+
+        Frames are encoded independently in image mode (T=1) by
+        utils/vjepa_embeddings_builder.py, and stored fp16 as
+        SEQUENCES_DIR/<seq>/vjepa_vitb/<frame>.npy.
+
+        as_grid=False (default) -> (grid_h * grid_w, embed_dim), the raw token
+        sequence as the encoder emits it.
+        as_grid=True            -> (grid_h, grid_w, embed_dim), tokens folded
+        back onto the image lattice (row-major, matching the wrapper's layout).
+        """
+        path = self.vjepa_base_latents[i]
+        if not pathlib.Path(path).exists():
+            raise FileNotFoundError(
+                f"No cached V-JEPA embedding at {path}. Run "
+                f"`python -m jepa_drive_wm.utils.vjepa_embeddings_builder "
+                f"--sequence {self.sequence_nr}` first."
+            )
+
+        feats = np.load(path).astype(dtype, copy=False)
+        if as_grid:
+            grid_h, grid_w = self.vjepa_grid_hw
+            feats = feats.reshape(grid_h, grid_w, -1)
+        return feats
+
 
     def _load_times(self) -> np.ndarray:
         times_path = self.sequence_folder / "times.txt"
@@ -193,6 +283,26 @@ class KITTISequence:
                 f"Pose count ({rows.shape[0]}) does not match frame count ({self.number_frames})"
             )
         return torch.from_numpy(T)
+
+    def _load_vjepa_base_latents(self) -> list[str]:
+        """
+        Paths to the per-frame V-JEPA ViT-B embeddings, one per left image and in
+        the same order. Also picks up the cache's _metadata.json so the token grid
+        shape comes from the builder rather than being hardcoded downstream.
+        """
+        vjepa_base_path = self.sequence_folder / VJEPA_BASE_DIRNAME
+
+        meta_path = vjepa_base_path / "_metadata.json"
+        self.vjepa_metadata: dict | None = None
+        self.vjepa_grid_hw: tuple[int, int] = VJEPA_BASE_GRID_HW
+        self.vjepa_embed_dim: int = VJEPA_BASE_EMBED_DIM
+        if meta_path.exists():
+            self.vjepa_metadata = json.loads(meta_path.read_text())
+            layout = self.vjepa_metadata["layout"]
+            self.vjepa_grid_hw = (layout["grid_h"], layout["grid_w"])
+            self.vjepa_embed_dim = layout["embed_dim"]
+
+        return [str(vjepa_base_path / f"{i:06d}.npy") for i in range(self.number_frames)]
 
     def __len__(self) -> int:
         return self.number_frames
