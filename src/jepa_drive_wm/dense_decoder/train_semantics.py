@@ -15,6 +15,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import wandb
 
 from jepa_drive_wm.dense_decoder.data_interface_dense import KITTIDenseLoaders
 from jepa_drive_wm.dense_decoder.model_semantics import SemanticDecoder
@@ -26,7 +27,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLASSES = 19       # Cityscapes train ids, as produced by OneFormer
 IGNORE_INDEX = 255     # pixels OneFormer left unlabeled
 
-EPOCHS = 25
+EPOCHS = 50
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 
@@ -103,6 +104,24 @@ def main() -> None:
     )
     print(loaders)
 
+    wandb.init(
+        project="jepa-drive-wm",
+        job_type="semantic_decoder",
+        config={
+            "epochs": EPOCHS,
+            "lr": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "num_classes": NUM_CLASSES,
+            "ignore_index": IGNORE_INDEX,
+            "train_sequences": TRAIN_SEQUENCES,
+            "validation_sequences": VALIDATION_SEQUENCES,
+            "test_sequences": TEST_SEQUENCES,
+        },
+    )
+    wandb.define_metric("epoch")
+    wandb.define_metric("train/*", step_metric="epoch")
+    wandb.define_metric("val/*", step_metric="epoch")
+
     model = SemanticDecoder().to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
@@ -113,13 +132,24 @@ def main() -> None:
     for epoch in range(1, EPOCHS + 1):
         train_metrics = run_epoch(model, loaders.train, optimizer)
         validation_metrics = run_epoch(model, loaders.validation)
-        scheduler.step()
 
         print(
             f"epoch {epoch:3d} | "
             f"train loss {train_metrics['loss']:.4f} acc {train_metrics['accuracy']:.4f} | "
             f"val loss {validation_metrics['loss']:.4f} acc {validation_metrics['accuracy']:.4f}"
         )
+        wandb.log(
+            {
+                "epoch": epoch,
+                "train/loss": train_metrics["loss"],
+                "train/accuracy": train_metrics["accuracy"],
+                # Logged before scheduler.step(): the LR these batches saw.
+                "train/lr": scheduler.get_last_lr()[0],
+                "val/loss": validation_metrics["loss"],
+                "val/accuracy": validation_metrics["accuracy"],
+            }
+        )
+        scheduler.step()
 
         if validation_metrics["loss"] < best_validation_loss:
             best_validation_loss = validation_metrics["loss"]
@@ -135,10 +165,21 @@ def main() -> None:
                 },
                 CHECKPOINT_PATH,
             )
+            wandb.summary["best_val_loss"] = validation_metrics["loss"]
+            wandb.summary["best_val_accuracy"] = validation_metrics["accuracy"]
+            wandb.summary["best_epoch"] = epoch
             print(f"          -> saved new best model to {CHECKPOINT_PATH}")
 
     test_metrics = run_epoch(model, loaders.test)
     print(f"test | loss {test_metrics['loss']:.4f} acc {test_metrics['accuracy']:.4f}")
+    # A single point, not a curve: it belongs in the summary, not the timeline.
+    wandb.summary.update(
+        {
+            "test/loss": test_metrics["loss"],
+            "test/accuracy": test_metrics["accuracy"],
+        }
+    )
+    wandb.finish()
 
 
 if __name__ == "__main__":

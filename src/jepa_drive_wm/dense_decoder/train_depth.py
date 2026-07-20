@@ -28,6 +28,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import wandb
 
 from jepa_drive_wm.dense_decoder.data_interface_dense import KITTIDenseLoaders
 from jepa_drive_wm.dense_decoder.model_depth import DepthDecoder
@@ -210,6 +211,28 @@ def main() -> None:
     )
     print(loaders)
 
+    wandb.init(
+        project="jepa-drive-wm",
+        job_type="depth_decoder",
+        config={
+            "epochs": EPOCHS,
+            "lr": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "min_depth": MIN_DEPTH,
+            "max_depth": MAX_DEPTH,
+            "silog_lambda": SILOG_LAMBDA,
+            "hn_scales": HN_SCALES,
+            "hn_weight": HN_WEIGHT,
+            "hn_min_valid_per_tile": HN_MIN_VALID_PER_TILE,
+            "train_sequences": TRAIN_SEQUENCES,
+            "validation_sequences": VALIDATION_SEQUENCES,
+            "test_sequences": TEST_SEQUENCES,
+        },
+    )
+    wandb.define_metric("epoch")
+    wandb.define_metric("train/*", step_metric="epoch")
+    wandb.define_metric("val/*", step_metric="epoch")
+
     model = DepthDecoder().to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
@@ -220,7 +243,6 @@ def main() -> None:
     for epoch in range(1, EPOCHS + 1):
         train_metrics = run_epoch(model, loaders.train, optimizer)
         validation_metrics = run_epoch(model, loaders.validation)
-        scheduler.step()
 
         print(
             f"epoch {epoch:3d} | "
@@ -229,6 +251,22 @@ def main() -> None:
             f"val total {validation_metrics['total']:.4f} "
             f"absrel {validation_metrics['absrel']:.4f}"
         )
+        wandb.log(
+            {
+                "epoch": epoch,
+                "train/total": train_metrics["total"],
+                "train/silog": train_metrics["silog"],
+                "train/hn": train_metrics["hn"],
+                "train/absrel": train_metrics["absrel"],
+                # Logged before scheduler.step(): the LR these batches saw.
+                "train/lr": scheduler.get_last_lr()[0],
+                "val/total": validation_metrics["total"],
+                "val/silog": validation_metrics["silog"],
+                "val/hn": validation_metrics["hn"],
+                "val/absrel": validation_metrics["absrel"],
+            }
+        )
+        scheduler.step()
 
         if validation_metrics["total"] < best_validation_loss:
             best_validation_loss = validation_metrics["total"]
@@ -247,10 +285,23 @@ def main() -> None:
                 },
                 CHECKPOINT_PATH,
             )
+            wandb.summary["best_val_total"] = validation_metrics["total"]
+            wandb.summary["best_val_absrel"] = validation_metrics["absrel"]
+            wandb.summary["best_epoch"] = epoch
             print(f"          -> saved new best model to {CHECKPOINT_PATH}")
 
     test_metrics = run_epoch(model, loaders.test)
     print(f"test | total {test_metrics['total']:.4f} absrel {test_metrics['absrel']:.4f}")
+    # A single point, not a curve: it belongs in the summary, not the timeline.
+    wandb.summary.update(
+        {
+            "test/total": test_metrics["total"],
+            "test/silog": test_metrics["silog"],
+            "test/hn": test_metrics["hn"],
+            "test/absrel": test_metrics["absrel"],
+        }
+    )
+    wandb.finish()
 
 
 if __name__ == "__main__":
