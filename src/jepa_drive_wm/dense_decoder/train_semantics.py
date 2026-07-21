@@ -38,7 +38,10 @@ WARMUP_FRAC = 0.03           # fraction of optimizer steps spent warming the LR 
 LEARNING_RATE = 3e-4         # peak LR (matches the old dpt probe runs' peak_lr)
 WEIGHT_DECAY = 0.01
 
-TRAIN_SEQUENCES = [0, 1, 2, 3, 5, 6, 8]
+# The dense decoders are per-frame and pose-free, so they train on ALL sequences
+# with pseudolabels -- including 11-21, which have no GT poses and so are unusable
+# for the world model but perfectly good here (this matches the old dpt recipe).
+TRAIN_SEQUENCES = [0, 1, 2, 3, 5, 6, 8] + list(range(11, 22))
 VALIDATION_SEQUENCES = [7, 10]
 TEST_SEQUENCES = [4, 9]
 

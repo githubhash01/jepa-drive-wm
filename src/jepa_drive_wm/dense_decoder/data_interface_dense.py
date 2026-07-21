@@ -1,6 +1,8 @@
+import pathlib
+
 import torch
 from torch.utils.data import Dataset, DataLoader
-from jepa_drive_wm.data.kitti import KITTISequence
+from jepa_drive_wm.data.kitti import KITTISequence, SEMANTICS_DIRNAME
 import numpy as np
 
 
@@ -35,15 +37,30 @@ class _KITTIDenseDataset(Dataset):
             for sequence_nr in sequence_numbers
         }
 
-        # Flat (sequence_nr, frame_index) index over every frame of every sequence.
-        self.index: list[tuple[int, int]] = [
-            (sequence_nr, frame_index)
-            for sequence_nr, sequence in self.sequences.items()
-            for frame_index in range(len(sequence))
-        ]
+        # Flat (sequence_nr, frame_index) index, skipping frames whose target
+        # pseudolabel is missing or corrupt. FoundationStereo leaves gaps (e.g.
+        # seq 08 has 71 frames with no depth) and a handful of 0-byte PNGs (seq
+        # 00 has 12); indexing them blindly would crash training mid-run. A valid
+        # depth/semantic PNG is tens of KB, so "exists and size > 0" is a safe,
+        # cheap filter -- no need to open every file.
+        self.index: list[tuple[int, int]] = []
+        for sequence_nr, sequence in self.sequences.items():
+            kept = 0
+            for frame_index in range(len(sequence)):
+                path = self._target_path(sequence, frame_index)
+                if path.exists() and path.stat().st_size > 0:
+                    self.index.append((sequence_nr, frame_index))
+                    kept += 1
+            skipped = len(sequence) - kept
+            note = f"  ({skipped} skipped: missing/empty target)" if skipped else ""
+            print(f"[{type(self).__name__}] seq {sequence_nr:02d}: {kept}/{len(sequence)} usable{note}")
 
     def __len__(self) -> int:
         return len(self.index)
+
+    def _target_path(self, sequence: KITTISequence, frame_index: int) -> pathlib.Path:
+        """Path to the target pseudolabel for one frame (used to skip gaps)."""
+        raise NotImplementedError
 
     def _load_target(self, sequence: KITTISequence, frame_index: int) -> torch.Tensor:
         raise NotImplementedError
@@ -65,12 +82,18 @@ class _KITTIDenseDataset(Dataset):
 
 
 class KITTIDepthDataset(_KITTIDenseDataset):
+    def _target_path(self, sequence: KITTISequence, frame_index: int) -> pathlib.Path:
+        return pathlib.Path(sequence.depths[frame_index])
+
     def _load_target(self, sequence: KITTISequence, frame_index: int) -> torch.Tensor:
         depth = sequence.get_depth(frame_index)          # (H, W) metres
         return torch.from_numpy(np.ascontiguousarray(depth)).float()
 
 
 class KITTISemanticDataset(_KITTIDenseDataset):
+    def _target_path(self, sequence: KITTISequence, frame_index: int) -> pathlib.Path:
+        return sequence.sequence_folder / SEMANTICS_DIRNAME / f"{frame_index:06d}.png"
+
     def _load_target(self, sequence: KITTISequence, frame_index: int) -> torch.Tensor:
         semantics = sequence.get_semantics(frame_index)  # (H, W) class ids
         return torch.from_numpy(np.ascontiguousarray(semantics)).long()
