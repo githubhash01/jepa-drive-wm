@@ -175,7 +175,7 @@ def main() -> None:
     parser.add_argument("--context-length", type=int, default=4)
     parser.add_argument("--future-length", type=int, default=2)
     parser.add_argument("--frame-stride", type=int, default=5)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8)  # hide shared-FS read latency
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument(
         "--smoke-test",

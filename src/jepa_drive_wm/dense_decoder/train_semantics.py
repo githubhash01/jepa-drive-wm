@@ -11,7 +11,9 @@ Pipeline per sample (batch_size=1):
 
 The best model (lowest validation loss) is saved to CHECKPOINT_PATH.
 """
+import argparse
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -34,9 +36,13 @@ MAX_ITERS = 50_000
 GRAD_ACCUM = 8               # effective batch size = GRAD_ACCUM * (loader batch 1)
 VAL_EVERY = 5_000            # micro-steps between validation + checkpoint
 LOG_EVERY = 100
+NUM_WORKERS = 8              # dedicated training box; more workers hide shared-FS read latency
 WARMUP_FRAC = 0.03           # fraction of optimizer steps spent warming the LR up
 LEARNING_RATE = 3e-4         # peak LR (matches the old dpt probe runs' peak_lr)
 WEIGHT_DECAY = 0.01
+
+# All of the above are defaults; every one is overridable on the command line
+# (see main's argparse) so budgets can be tuned per-machine without editing files.
 
 # The dense decoders are per-frame and pose-free, so they train on ALL sequences
 # with pseudolabels -- including 11-21, which have no GT poses and so are unusable
@@ -92,7 +98,7 @@ def evaluate(model: SemanticDecoder, loader) -> dict[str, float]:
     return {"loss": total_loss / n, "accuracy": total_accuracy / n}
 
 
-def save_checkpoint(model: SemanticDecoder, iteration: int, metrics: dict[str, float]) -> None:
+def save_checkpoint(model: SemanticDecoder, iteration: int, metrics: dict[str, float], path: Path) -> None:
     torch.save(
         {
             "iteration": iteration,
@@ -100,32 +106,45 @@ def save_checkpoint(model: SemanticDecoder, iteration: int, metrics: dict[str, f
             "validation_metrics": metrics,
             "config": {"num_classes": NUM_CLASSES, "ignore_index": IGNORE_INDEX},
         },
-        CHECKPOINT_PATH,
+        path,
     )
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Train the dense semantic decoder")
+    parser.add_argument("--max-iters", type=int, default=MAX_ITERS)
+    parser.add_argument("--grad-accum", type=int, default=GRAD_ACCUM)
+    parser.add_argument("--val-every", type=int, default=VAL_EVERY)
+    parser.add_argument("--log-every", type=int, default=LOG_EVERY)
+    parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--warmup-frac", type=float, default=WARMUP_FRAC)
+    parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
+    args = parser.parse_args()
+
     loaders = KITTIDenseLoaders(
         task="semantics",
         training_sequences=TRAIN_SEQUENCES,
         validation_sequences=VALIDATION_SEQUENCES,
         test_sequences=TEST_SEQUENCES,
         batch_size=1,
-        num_workers=4,
+        num_workers=args.num_workers,
     )
     print(loaders)
 
-    total_opt_steps = MAX_ITERS // GRAD_ACCUM
+    total_opt_steps = args.max_iters // args.grad_accum
     wandb.init(
         project="jepa-drive-wm",
         job_type="semantic_decoder",
         config={
-            "max_iters": MAX_ITERS,
-            "grad_accum": GRAD_ACCUM,
-            "effective_batch": GRAD_ACCUM,
+            "max_iters": args.max_iters,
+            "grad_accum": args.grad_accum,
+            "effective_batch": args.grad_accum,
+            "num_workers": args.num_workers,
             "amp_dtype": "bfloat16",
-            "lr": LEARNING_RATE,
-            "weight_decay": WEIGHT_DECAY,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
             "num_classes": NUM_CLASSES,
             "ignore_index": IGNORE_INDEX,
             "train_sequences": TRAIN_SEQUENCES,
@@ -138,10 +157,10 @@ def main() -> None:
     wandb.define_metric("val/*", step_metric="iter")
 
     model = SemanticDecoder().to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = build_warmup_cosine(optimizer, total_opt_steps, int(WARMUP_FRAC * total_opt_steps))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = build_warmup_cosine(optimizer, total_opt_steps, int(args.warmup_frac * total_opt_steps))
 
-    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
     best_validation_loss = float("inf")
 
     train_batches = infinite(loaders.train)
@@ -151,16 +170,16 @@ def main() -> None:
     model.train()
     start = time.time()
 
-    for iteration in range(1, MAX_ITERS + 1):
+    for iteration in range(1, args.max_iters + 1):
         batch = next(train_batches)
         features = batch["features"].to(DEVICE, non_blocking=True)  # [1, C, H, W]
         target = batch["target"].to(DEVICE, non_blocking=True)      # [1, H_img, W_img]
 
         logits = predict(model, features, target.shape[-2:])
         loss = F.cross_entropy(logits, target, ignore_index=IGNORE_INDEX)
-        (loss / GRAD_ACCUM).backward()
+        (loss / args.grad_accum).backward()
 
-        if iteration % GRAD_ACCUM == 0:
+        if iteration % args.grad_accum == 0:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
@@ -171,13 +190,13 @@ def main() -> None:
         running_loss += loss.item()
         running_acc += acc.item()
 
-        if iteration % LOG_EVERY == 0:
+        if iteration % args.log_every == 0:
             rate = iteration / (time.time() - start)
-            mean_loss = running_loss / LOG_EVERY
-            mean_acc = running_acc / LOG_EVERY
+            mean_loss = running_loss / args.log_every
+            mean_acc = running_acc / args.log_every
             running_loss = running_acc = 0.0
             print(
-                f"iter {iteration:6d}/{MAX_ITERS} | loss {mean_loss:.4f} acc {mean_acc:.4f} | "
+                f"iter {iteration:6d}/{args.max_iters} | loss {mean_loss:.4f} acc {mean_acc:.4f} | "
                 f"lr {scheduler.get_last_lr()[0]:.2e} | {rate:.1f} it/s",
                 flush=True,
             )
@@ -190,7 +209,7 @@ def main() -> None:
                 }
             )
 
-        if iteration % VAL_EVERY == 0 or iteration == MAX_ITERS:
+        if iteration % args.val_every == 0 or iteration == args.max_iters:
             validation_metrics = evaluate(model, loaders.validation)
             model.train()
             print(
@@ -207,11 +226,11 @@ def main() -> None:
             )
             if validation_metrics["loss"] < best_validation_loss:
                 best_validation_loss = validation_metrics["loss"]
-                save_checkpoint(model, iteration, validation_metrics)
+                save_checkpoint(model, iteration, validation_metrics, args.checkpoint)
                 wandb.summary["best_val_loss"] = validation_metrics["loss"]
                 wandb.summary["best_val_accuracy"] = validation_metrics["accuracy"]
                 wandb.summary["best_iter"] = iteration
-                print(f"          -> saved new best model to {CHECKPOINT_PATH}")
+                print(f"          -> saved new best model to {args.checkpoint}")
 
     test_metrics = evaluate(model, loaders.test)
     print(f"test | loss {test_metrics['loss']:.4f} acc {test_metrics['accuracy']:.4f}")
