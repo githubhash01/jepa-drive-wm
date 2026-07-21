@@ -24,7 +24,7 @@ Losses follow https://arxiv.org/pdf/2604.26454:
 
 The best model (lowest validation loss) is saved to CHECKPOINT_PATH.
 """
-from pathlib import Path
+import time
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +33,7 @@ import wandb
 from jepa_drive_wm.dense_decoder.data_interface_dense import KITTIDenseLoaders
 from jepa_drive_wm.dense_decoder.model_depth import DepthDecoder
 from jepa_drive_wm.paths import OUTPUTS_DIR
+from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite
 
 # ----------------------------------------------------------------------------- config
 
@@ -47,8 +48,15 @@ HN_SCALES = (1, 4, 8)        # M: image tiled into an M x M grid per scale
 HN_WEIGHT = 1.0              # total = silog + HN_WEIGHT * hn
 HN_MIN_VALID_PER_TILE = 32   # skip tiles with fewer valid pixels (stats too noisy)
 
-EPOCHS = 50
-LEARNING_RATE = 1e-4
+# Iteration budget, not epochs: the proven DPT recipe trained a fixed number of
+# forward/backward passes with a cosine schedule (see training_utils). MAX_ITERS
+# counts micro-steps; GRAD_ACCUM of them make one effective-batch-8 optimizer step.
+MAX_ITERS = 50_000
+GRAD_ACCUM = 8               # effective batch size = GRAD_ACCUM * (loader batch 1)
+VAL_EVERY = 5_000            # micro-steps between validation + checkpoint
+LOG_EVERY = 100
+WARMUP_FRAC = 0.03           # fraction of optimizer steps spent warming the LR up
+LEARNING_RATE = 3e-4         # peak LR (matches the old dpt_bins run's peak_lr)
 WEIGHT_DECAY = 0.01
 
 TRAIN_SEQUENCES = [0, 1, 2, 3, 5, 6, 8]
@@ -135,7 +143,7 @@ def _loss_hn(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> t
 def loss(pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
     """
     Combined loss for one frame. pred and target are [H, W] metric depth.
-    Returns the components too, so run_epoch can log them separately.
+    Returns the components too, so the caller can log them separately.
     """
     valid = _valid_mask(target)
     silog = _loss_silog(pred, target, valid)
@@ -153,52 +161,59 @@ def predict(model: DepthDecoder, features: torch.Tensor, target_shape: tuple[int
     """
     features: [1, C, H, W] V-JEPA grid -> metric depth [H_img, W_img] at
     pseudolabel resolution (DPT output is bilinearly upsampled to match).
+
+    The DPT runs under bf16 autocast; the depth map is upcast to fp32 before the
+    upsample so the SiLog/HN losses (log, median, MAD) stay numerically stable.
     """
-    depth = model(features)  # [1, 1, h, w]
-    depth = F.interpolate(depth, size=target_shape, mode="bilinear", align_corners=False)
+    with autocast(DEVICE):
+        depth = model(features)  # [1, 1, h, w]
+    depth = F.interpolate(depth.float(), size=target_shape, mode="bilinear", align_corners=False)
     return depth[0, 0]
 
 
 # ----------------------------------------------------------------------------- loops
 
-def run_epoch(
-    model: DepthDecoder,
-    loader,
-    optimizer: torch.optim.Optimizer | None = None,
-) -> dict[str, float]:
-    """
-    One pass over `loader`. Trains if an optimizer is given, else evaluates.
-    Returns mean loss components plus AbsRel as a sanity metric.
-    """
-    training = optimizer is not None
-    model.train(training)
-
+@torch.no_grad()
+def evaluate(model: DepthDecoder, loader) -> dict[str, float]:
+    """Forward-only pass over `loader`; mean loss components plus AbsRel."""
+    model.eval()
     totals = {"silog": 0.0, "hn": 0.0, "total": 0.0, "absrel": 0.0}
     n_frames = 0
 
-    with torch.set_grad_enabled(training):
-        for batch in loader:
-            features = batch["features"].to(DEVICE, non_blocking=True)  # [1, C, H, W]
-            target = batch["target"][0].to(DEVICE, non_blocking=True)   # [H_img, W_img]
+    for batch in loader:
+        features = batch["features"].to(DEVICE, non_blocking=True)  # [1, C, H, W]
+        target = batch["target"][0].to(DEVICE, non_blocking=True)   # [H_img, W_img]
 
-            pred = predict(model, features, target.shape)
-            losses = loss(pred, target)
+        pred = predict(model, features, target.shape)
+        losses = loss(pred, target)
 
-            if training:
-                optimizer.zero_grad(set_to_none=True)
-                losses["total"].backward()
-                optimizer.step()
+        valid = _valid_mask(target)
+        absrel = ((pred[valid] - target[valid]).abs() / target[valid]).mean()
 
-            with torch.no_grad():
-                valid = _valid_mask(target)
-                absrel = ((pred[valid] - target[valid]).abs() / target[valid]).mean()
-
-            for key in ("silog", "hn", "total"):
-                totals[key] += losses[key].item()
-            totals["absrel"] += absrel.item()
-            n_frames += 1
+        for key in ("silog", "hn", "total"):
+            totals[key] += losses[key].item()
+        totals["absrel"] += absrel.item()
+        n_frames += 1
 
     return {key: value / max(n_frames, 1) for key, value in totals.items()}
+
+
+def save_checkpoint(model: DepthDecoder, iteration: int, metrics: dict[str, float]) -> None:
+    torch.save(
+        {
+            "iteration": iteration,
+            "model_state_dict": model.state_dict(),
+            "validation_metrics": metrics,
+            "config": {
+                "min_depth": MIN_DEPTH,
+                "max_depth": MAX_DEPTH,
+                "silog_lambda": SILOG_LAMBDA,
+                "hn_scales": HN_SCALES,
+                "hn_weight": HN_WEIGHT,
+            },
+        },
+        CHECKPOINT_PATH,
+    )
 
 
 def main() -> None:
@@ -212,11 +227,15 @@ def main() -> None:
     )
     print(loaders)
 
+    total_opt_steps = MAX_ITERS // GRAD_ACCUM
     wandb.init(
         project="jepa-drive-wm",
         job_type="depth_decoder",
         config={
-            "epochs": EPOCHS,
+            "max_iters": MAX_ITERS,
+            "grad_accum": GRAD_ACCUM,
+            "effective_batch": GRAD_ACCUM,
+            "amp_dtype": "bfloat16",
             "lr": LEARNING_RATE,
             "weight_decay": WEIGHT_DECAY,
             "min_depth": MIN_DEPTH,
@@ -230,68 +249,87 @@ def main() -> None:
             "test_sequences": TEST_SEQUENCES,
         },
     )
-    wandb.define_metric("epoch")
-    wandb.define_metric("train/*", step_metric="epoch")
-    wandb.define_metric("val/*", step_metric="epoch")
+    wandb.define_metric("iter")
+    wandb.define_metric("train/*", step_metric="iter")
+    wandb.define_metric("val/*", step_metric="iter")
 
     model = DepthDecoder().to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scheduler = build_warmup_cosine(optimizer, total_opt_steps, int(WARMUP_FRAC * total_opt_steps))
 
     CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
     best_validation_loss = float("inf")
 
-    for epoch in range(1, EPOCHS + 1):
-        train_metrics = run_epoch(model, loaders.train, optimizer)
-        validation_metrics = run_epoch(model, loaders.validation)
+    train_batches = infinite(loaders.train)
+    running = {"silog": 0.0, "hn": 0.0, "total": 0.0}
+    optimizer.zero_grad(set_to_none=True)
+    model.train()
+    start = time.time()
 
-        print(
-            f"epoch {epoch:3d} | "
-            f"train total {train_metrics['total']:.4f} "
-            f"(silog {train_metrics['silog']:.4f}, hn {train_metrics['hn']:.4f}) | "
-            f"val total {validation_metrics['total']:.4f} "
-            f"absrel {validation_metrics['absrel']:.4f}"
-        )
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/total": train_metrics["total"],
-                "train/silog": train_metrics["silog"],
-                "train/hn": train_metrics["hn"],
-                "train/absrel": train_metrics["absrel"],
-                # Logged before scheduler.step(): the LR these batches saw.
-                "train/lr": scheduler.get_last_lr()[0],
-                "val/total": validation_metrics["total"],
-                "val/silog": validation_metrics["silog"],
-                "val/hn": validation_metrics["hn"],
-                "val/absrel": validation_metrics["absrel"],
-            }
-        )
-        scheduler.step()
+    for iteration in range(1, MAX_ITERS + 1):
+        batch = next(train_batches)
+        features = batch["features"].to(DEVICE, non_blocking=True)  # [1, C, H, W]
+        target = batch["target"][0].to(DEVICE, non_blocking=True)   # [H_img, W_img]
 
-        if validation_metrics["total"] < best_validation_loss:
-            best_validation_loss = validation_metrics["total"]
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "validation_metrics": validation_metrics,
-                    "config": {
-                        "min_depth": MIN_DEPTH,
-                        "max_depth": MAX_DEPTH,
-                        "silog_lambda": SILOG_LAMBDA,
-                        "hn_scales": HN_SCALES,
-                        "hn_weight": HN_WEIGHT,
-                    },
-                },
-                CHECKPOINT_PATH,
+        pred = predict(model, features, target.shape)
+        losses = loss(pred, target)
+        # Scale by 1/accum so accumulated grads average the micro-batches.
+        (losses["total"] / GRAD_ACCUM).backward()
+
+        if iteration % GRAD_ACCUM == 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+
+        for key in running:
+            running[key] += losses[key].item()
+
+        if iteration % LOG_EVERY == 0:
+            rate = iteration / (time.time() - start)
+            means = {key: value / LOG_EVERY for key, value in running.items()}
+            running = {key: 0.0 for key in running}
+            print(
+                f"iter {iteration:6d}/{MAX_ITERS} | total {means['total']:.4f} "
+                f"(silog {means['silog']:.4f}, hn {means['hn']:.4f}) | "
+                f"lr {scheduler.get_last_lr()[0]:.2e} | {rate:.1f} it/s",
+                flush=True,
             )
-            wandb.summary["best_val_total"] = validation_metrics["total"]
-            wandb.summary["best_val_absrel"] = validation_metrics["absrel"]
-            wandb.summary["best_epoch"] = epoch
-            print(f"          -> saved new best model to {CHECKPOINT_PATH}")
+            wandb.log(
+                {
+                    "iter": iteration,
+                    "train/total": means["total"],
+                    "train/silog": means["silog"],
+                    "train/hn": means["hn"],
+                    "train/lr": scheduler.get_last_lr()[0],
+                }
+            )
 
-    test_metrics = run_epoch(model, loaders.test)
+        if iteration % VAL_EVERY == 0 or iteration == MAX_ITERS:
+            validation_metrics = evaluate(model, loaders.validation)
+            model.train()
+            print(
+                f"  [val] iter {iteration} | total {validation_metrics['total']:.4f} "
+                f"absrel {validation_metrics['absrel']:.4f}",
+                flush=True,
+            )
+            wandb.log(
+                {
+                    "iter": iteration,
+                    "val/total": validation_metrics["total"],
+                    "val/silog": validation_metrics["silog"],
+                    "val/hn": validation_metrics["hn"],
+                    "val/absrel": validation_metrics["absrel"],
+                }
+            )
+            if validation_metrics["total"] < best_validation_loss:
+                best_validation_loss = validation_metrics["total"]
+                save_checkpoint(model, iteration, validation_metrics)
+                wandb.summary["best_val_total"] = validation_metrics["total"]
+                wandb.summary["best_val_absrel"] = validation_metrics["absrel"]
+                wandb.summary["best_iter"] = iteration
+                print(f"          -> saved new best model to {CHECKPOINT_PATH}")
+
+    test_metrics = evaluate(model, loaders.test)
     print(f"test | total {test_metrics['total']:.4f} absrel {test_metrics['absrel']:.4f}")
     # A single point, not a curve: it belongs in the summary, not the timeline.
     wandb.summary.update(

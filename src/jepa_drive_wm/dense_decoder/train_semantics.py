@@ -11,7 +11,7 @@ Pipeline per sample (batch_size=1):
 
 The best model (lowest validation loss) is saved to CHECKPOINT_PATH.
 """
-from pathlib import Path
+import time
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +20,7 @@ import wandb
 from jepa_drive_wm.dense_decoder.data_interface_dense import KITTIDenseLoaders
 from jepa_drive_wm.dense_decoder.model_semantics import SemanticDecoder
 from jepa_drive_wm.paths import OUTPUTS_DIR
+from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite
 
 # ----------------------------------------------------------------------------- config
 
@@ -28,8 +29,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLASSES = 19       # Cityscapes train ids, as produced by OneFormer
 IGNORE_INDEX = 255     # pixels OneFormer left unlabeled
 
-EPOCHS = 50
-LEARNING_RATE = 1e-4
+# Iteration budget, not epochs (see training_utils / train_depth for the rationale).
+MAX_ITERS = 50_000
+GRAD_ACCUM = 8               # effective batch size = GRAD_ACCUM * (loader batch 1)
+VAL_EVERY = 5_000            # micro-steps between validation + checkpoint
+LOG_EVERY = 100
+WARMUP_FRAC = 0.03           # fraction of optimizer steps spent warming the LR up
+LEARNING_RATE = 3e-4         # peak LR (matches the old dpt probe runs' peak_lr)
 WEIGHT_DECAY = 0.01
 
 TRAIN_SEQUENCES = [0, 1, 2, 3, 5, 6, 8]
@@ -45,53 +51,54 @@ def predict(model: SemanticDecoder, features: torch.Tensor, target_shape: tuple[
     """
     features: [1, C, H, W] V-JEPA grid -> class logits [1, 19, H_img, W_img]
     at pseudolabel resolution (DPT output is bilinearly upsampled to match).
+
+    The DPT runs under bf16 autocast; logits are upcast to fp32 before the
+    upsample so the cross-entropy is computed in full precision.
     """
-    logits = model(features)  # [1, 19, h, w]
-    return F.interpolate(logits, size=target_shape, mode="bilinear", align_corners=False)
+    with autocast(DEVICE):
+        logits = model(features)  # [1, 19, h, w]
+    return F.interpolate(logits.float(), size=target_shape, mode="bilinear", align_corners=False)
 
 
 # ----------------------------------------------------------------------------- loops
 
-def run_epoch(
-    model: SemanticDecoder,
-    loader,
-    optimizer: torch.optim.Optimizer | None = None,
-) -> dict[str, float]:
-    """
-    One pass over `loader`. Trains if an optimizer is given, else evaluates.
-    Returns mean cross entropy and pixel accuracy.
-    """
-    training = optimizer is not None
-    model.train(training)
-
+@torch.no_grad()
+def evaluate(model: SemanticDecoder, loader) -> dict[str, float]:
+    """Forward-only pass over `loader`; mean cross entropy and pixel accuracy."""
+    model.eval()
     total_loss = 0.0
     total_accuracy = 0.0
     n_frames = 0
 
-    with torch.set_grad_enabled(training):
-        for batch in loader:
-            features = batch["features"].to(DEVICE, non_blocking=True)  # [1, C, H, W]
-            target = batch["target"].to(DEVICE, non_blocking=True)      # [1, H_img, W_img]
+    for batch in loader:
+        features = batch["features"].to(DEVICE, non_blocking=True)  # [1, C, H, W]
+        target = batch["target"].to(DEVICE, non_blocking=True)      # [1, H_img, W_img]
 
-            logits = predict(model, features, target.shape[-2:])
-            loss = F.cross_entropy(logits, target, ignore_index=IGNORE_INDEX)
+        logits = predict(model, features, target.shape[-2:])
+        loss = F.cross_entropy(logits, target, ignore_index=IGNORE_INDEX)
 
-            if training:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+        labeled = target != IGNORE_INDEX
+        correct = logits.argmax(dim=1)[labeled] == target[labeled]
+        accuracy = correct.float().mean() if labeled.any() else torch.zeros(())
 
-            with torch.no_grad():
-                labeled = target != IGNORE_INDEX
-                correct = logits.argmax(dim=1)[labeled] == target[labeled]
-                accuracy = correct.float().mean() if labeled.any() else torch.zeros(())
-
-            total_loss += loss.item()
-            total_accuracy += accuracy.item()
-            n_frames += 1
+        total_loss += loss.item()
+        total_accuracy += accuracy.item()
+        n_frames += 1
 
     n = max(n_frames, 1)
     return {"loss": total_loss / n, "accuracy": total_accuracy / n}
+
+
+def save_checkpoint(model: SemanticDecoder, iteration: int, metrics: dict[str, float]) -> None:
+    torch.save(
+        {
+            "iteration": iteration,
+            "model_state_dict": model.state_dict(),
+            "validation_metrics": metrics,
+            "config": {"num_classes": NUM_CLASSES, "ignore_index": IGNORE_INDEX},
+        },
+        CHECKPOINT_PATH,
+    )
 
 
 def main() -> None:
@@ -105,11 +112,15 @@ def main() -> None:
     )
     print(loaders)
 
+    total_opt_steps = MAX_ITERS // GRAD_ACCUM
     wandb.init(
         project="jepa-drive-wm",
         job_type="semantic_decoder",
         config={
-            "epochs": EPOCHS,
+            "max_iters": MAX_ITERS,
+            "grad_accum": GRAD_ACCUM,
+            "effective_batch": GRAD_ACCUM,
+            "amp_dtype": "bfloat16",
             "lr": LEARNING_RATE,
             "weight_decay": WEIGHT_DECAY,
             "num_classes": NUM_CLASSES,
@@ -119,59 +130,87 @@ def main() -> None:
             "test_sequences": TEST_SEQUENCES,
         },
     )
-    wandb.define_metric("epoch")
-    wandb.define_metric("train/*", step_metric="epoch")
-    wandb.define_metric("val/*", step_metric="epoch")
+    wandb.define_metric("iter")
+    wandb.define_metric("train/*", step_metric="iter")
+    wandb.define_metric("val/*", step_metric="iter")
 
     model = SemanticDecoder().to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scheduler = build_warmup_cosine(optimizer, total_opt_steps, int(WARMUP_FRAC * total_opt_steps))
 
     CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
     best_validation_loss = float("inf")
 
-    for epoch in range(1, EPOCHS + 1):
-        train_metrics = run_epoch(model, loaders.train, optimizer)
-        validation_metrics = run_epoch(model, loaders.validation)
+    train_batches = infinite(loaders.train)
+    running_loss = 0.0
+    running_acc = 0.0
+    optimizer.zero_grad(set_to_none=True)
+    model.train()
+    start = time.time()
 
-        print(
-            f"epoch {epoch:3d} | "
-            f"train loss {train_metrics['loss']:.4f} acc {train_metrics['accuracy']:.4f} | "
-            f"val loss {validation_metrics['loss']:.4f} acc {validation_metrics['accuracy']:.4f}"
-        )
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/loss": train_metrics["loss"],
-                "train/accuracy": train_metrics["accuracy"],
-                # Logged before scheduler.step(): the LR these batches saw.
-                "train/lr": scheduler.get_last_lr()[0],
-                "val/loss": validation_metrics["loss"],
-                "val/accuracy": validation_metrics["accuracy"],
-            }
-        )
-        scheduler.step()
+    for iteration in range(1, MAX_ITERS + 1):
+        batch = next(train_batches)
+        features = batch["features"].to(DEVICE, non_blocking=True)  # [1, C, H, W]
+        target = batch["target"].to(DEVICE, non_blocking=True)      # [1, H_img, W_img]
 
-        if validation_metrics["loss"] < best_validation_loss:
-            best_validation_loss = validation_metrics["loss"]
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "validation_metrics": validation_metrics,
-                    "config": {
-                        "num_classes": NUM_CLASSES,
-                        "ignore_index": IGNORE_INDEX,
-                    },
-                },
-                CHECKPOINT_PATH,
+        logits = predict(model, features, target.shape[-2:])
+        loss = F.cross_entropy(logits, target, ignore_index=IGNORE_INDEX)
+        (loss / GRAD_ACCUM).backward()
+
+        if iteration % GRAD_ACCUM == 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+
+        with torch.no_grad():
+            labeled = target != IGNORE_INDEX
+            acc = (logits.argmax(dim=1)[labeled] == target[labeled]).float().mean() if labeled.any() else torch.zeros(())
+        running_loss += loss.item()
+        running_acc += acc.item()
+
+        if iteration % LOG_EVERY == 0:
+            rate = iteration / (time.time() - start)
+            mean_loss = running_loss / LOG_EVERY
+            mean_acc = running_acc / LOG_EVERY
+            running_loss = running_acc = 0.0
+            print(
+                f"iter {iteration:6d}/{MAX_ITERS} | loss {mean_loss:.4f} acc {mean_acc:.4f} | "
+                f"lr {scheduler.get_last_lr()[0]:.2e} | {rate:.1f} it/s",
+                flush=True,
             )
-            wandb.summary["best_val_loss"] = validation_metrics["loss"]
-            wandb.summary["best_val_accuracy"] = validation_metrics["accuracy"]
-            wandb.summary["best_epoch"] = epoch
-            print(f"          -> saved new best model to {CHECKPOINT_PATH}")
+            wandb.log(
+                {
+                    "iter": iteration,
+                    "train/loss": mean_loss,
+                    "train/accuracy": mean_acc,
+                    "train/lr": scheduler.get_last_lr()[0],
+                }
+            )
 
-    test_metrics = run_epoch(model, loaders.test)
+        if iteration % VAL_EVERY == 0 or iteration == MAX_ITERS:
+            validation_metrics = evaluate(model, loaders.validation)
+            model.train()
+            print(
+                f"  [val] iter {iteration} | loss {validation_metrics['loss']:.4f} "
+                f"acc {validation_metrics['accuracy']:.4f}",
+                flush=True,
+            )
+            wandb.log(
+                {
+                    "iter": iteration,
+                    "val/loss": validation_metrics["loss"],
+                    "val/accuracy": validation_metrics["accuracy"],
+                }
+            )
+            if validation_metrics["loss"] < best_validation_loss:
+                best_validation_loss = validation_metrics["loss"]
+                save_checkpoint(model, iteration, validation_metrics)
+                wandb.summary["best_val_loss"] = validation_metrics["loss"]
+                wandb.summary["best_val_accuracy"] = validation_metrics["accuracy"]
+                wandb.summary["best_iter"] = iteration
+                print(f"          -> saved new best model to {CHECKPOINT_PATH}")
+
+    test_metrics = evaluate(model, loaders.test)
     print(f"test | loss {test_metrics['loss']:.4f} acc {test_metrics['accuracy']:.4f}")
     # A single point, not a curve: it belongs in the summary, not the timeline.
     wandb.summary.update(
