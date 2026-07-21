@@ -25,20 +25,30 @@ POSES_SRC="$KITTI_ROOT/data_odometry_poses"
 DEST="$USB_ROOT/jepa-drive-wm-transfer"
 
 echo "Packing to $DEST"
-mkdir -p "$DEST/checkpoints"
+# rsync only creates the final component of its destination, not the whole
+# chain, so pre-create the nested KITTI dirs (and checkpoints).
+mkdir -p "$DEST/checkpoints" \
+         "$DEST/KITTI/data_odometry_color/dataset/sequences" \
+         "$DEST/KITTI/data_odometry_poses"
+
+# -rt (not -a): keep it recursive + timestamps (so re-runs skip done files) but
+# DON'T try to preserve Unix perms/ownership -- exFAT/FAT can't store them and
+# rsync would exit non-zero under `set -e`. --partial keeps half-copied files
+# (e.g. the 1.6G checkpoint) so an interrupted run resumes instead of restarting.
+RSYNC="rsync -rt --partial --info=progress2"
 
 # Sequences: everything except image_3 and the regenerable latent caches.
-rsync -a --info=progress2 \
+$RSYNC \
     --exclude='image_3/' \
     --exclude='vjepa_vitb/' \
     --exclude='vjepa_vitb_hier/' \
     "$SEQ_SRC/" "$DEST/KITTI/data_odometry_color/dataset/sequences/"
 
 # Ground-truth poses (tiny).
-rsync -a --info=progress2 "$POSES_SRC/" "$DEST/KITTI/data_odometry_poses/"
+$RSYNC "$POSES_SRC/" "$DEST/KITTI/data_odometry_poses/"
 
 # The one checkpoint the code loads.
-rsync -a --info=progress2 "$CKPT" "$DEST/checkpoints/"
+$RSYNC "$CKPT" "$DEST/checkpoints/"
 
 echo
 echo "Done. Stick payload:"
