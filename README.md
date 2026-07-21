@@ -31,18 +31,26 @@ Defaults are relative to the repo root, so a clone with data under
    pip install -r requirements.txt
    pip install -e .
    ```
-3. **Data** — from the transfer USB stick:
+3. **Weights & Biases** — all training logs to the `jepa-drive-wm` project, so
+   authenticate before launching (an unauthenticated run started under
+   `tmux`/`nohup` will hang on the interactive login prompt):
+   ```bash
+   wandb login                    # paste the key from https://wandb.ai/authorize
+   # headless alternative: export WANDB_API_KEY=<key>   (add to your shell rc)
+   # no network? export WANDB_MODE=offline, then `wandb sync wandb/latest-run` later
+   ```
+4. **Data** — from the transfer USB stick:
    ```bash
    ./scripts/migrate/unpack_uni.sh /media/<user>/<STICK>/jepa-drive-wm-transfer "$PWD"
    ```
    This lays KITTI (images, depth + semantic pseudolabels, poses) into
    `dataset/KITTI/` and the ViT-B checkpoint into `vjepa2/model_checkpoints/vjepa21/`.
-4. **Regenerate V-JEPA latents** (not transferred — 117G, rebuilt on the GPU):
+5. **Regenerate V-JEPA latents** (not transferred — 117G, rebuilt on the GPU):
    ```bash
    ./scripts/migrate/build_latents_all.sh 4      # smoke test: smallest sequence (271 frames)
    ./scripts/migrate/build_latents_all.sh        # all sequences 0..21 (~43.5k frames)
    ```
-5. **Smoke tests**
+6. **Smoke tests**
    ```bash
    PYTHONPATH=src python -m jepa_drive_wm.data.kitti                          # calib sanity
    PYTHONPATH=src python -m jepa_drive_wm.dense_decoder.data_interface_dense  # dense batches
