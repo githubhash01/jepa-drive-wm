@@ -26,6 +26,7 @@ from jaxtyping import Float
 from torch import Tensor
 
 from jepa_drive_wm.paths import OUTPUTS_DIR
+from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite
 from jepa_drive_wm.world_model.data_interface_wm import KITTIRolloutLoaders
 from jepa_drive_wm.world_model.model import VJEPA21WorldModel
 
@@ -65,9 +66,13 @@ def latent_loss(
     pred: Float[Tensor, "batch steps height width latent"],
     target: Float[Tensor, "batch steps height width latent"],
 ) -> Float[Tensor, ""]:
-    """L1 between layer-normalised latents (VJEPA2-AC's normalize_reps)."""
-    pred = F.layer_norm(pred, (pred.size(-1),))
-    target = F.layer_norm(target, (target.size(-1),))
+    """L1 between layer-normalised latents (VJEPA2-AC's normalize_reps).
+
+    Cast to fp32 first: predictions arrive in bf16 under autocast, and the
+    layer-norm + L1 are cheap, so we do them in full precision for a stable loss.
+    """
+    pred = F.layer_norm(pred.float(), (pred.size(-1),))
+    target = F.layer_norm(target.float(), (target.size(-1),))
     return F.l1_loss(pred, target)
 
 
@@ -110,90 +115,60 @@ def forward_predictions(
     return torch.stack(tf_preds, dim=1), torch.stack(ar_preds, dim=1)
 
 
-def run_epoch(
+def batch_losses(
+    model: VJEPA21WorldModel,
+    batch: dict,
+    device: torch.device,
+    act_scale: torch.Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Teacher-forcing and rollout losses for one batch, under bf16 autocast.
+
+    `act_scale` is action_scale(step_seconds) already on-device; passing it in
+    keeps the action normalisation identical between train and eval.
+    """
+    context = to_grid(
+        batch["context_latents"].to(device), model.grid_height, model.grid_width
+    )
+    future = to_grid(
+        batch["future_latents"].to(device), model.grid_height, model.grid_width
+    )
+    ego_motions = batch["future_ego_motions"].to(device) / act_scale
+
+    with autocast(device):
+        tf_preds, ar_preds = forward_predictions(model, context, ego_motions, future)
+    # latent_loss upcasts to fp32 internally.
+    return latent_loss(tf_preds, future), latent_loss(ar_preds, future)
+
+
+@torch.no_grad()
+def evaluate(
     model: VJEPA21WorldModel,
     loader,
     device: torch.device,
     step_seconds: float,
-    optimizer: torch.optim.Optimizer | None = None,
-    log_every: int = 50,
-    tag: str = "train",
-    global_step: int = 0,
-) -> tuple[float, float, int]:
-    """One pass over a loader. Trains if an optimizer is given, else evaluates.
-    Returns mean (teacher forcing, rollout) losses and the updated global step.
-
-    `step_seconds` is the physical duration of one prediction step; take it
-    from KITTIRolloutLoaders.step_seconds rather than recomputing it, so the
-    action normalisation always agrees with the data pipeline. Passing it
-    explicitly also keeps this function working on any iterable of batches
-    (e.g. the smoke test's plain list), not just a DataLoader.
-
-    Logs the moment the first batch arrives (so a stalled data pipeline is
-    obvious immediately) and a running average every `log_every` steps.
-    Per-batch wandb logging happens only when training; per-epoch logging is
-    the caller's job.
-    """
-    training = optimizer is not None
-    model.train(training)
+) -> tuple[float, float]:
+    """Forward-only pass; mean (teacher forcing, rollout) losses."""
+    model.eval()
     act_scale = action_scale(step_seconds).to(device)
-
     tf_total, ar_total = 0.0, 0.0
-    start = time.time()
-    for step, batch in enumerate(loader):
-        if step == 0:
-            print(f"  [{tag}] first batch in {time.time() - start:.1f}s", flush=True)
-
-        context = to_grid(
-            batch["context_latents"].to(device), model.grid_height, model.grid_width
-        )
-        future = to_grid(
-            batch["future_latents"].to(device), model.grid_height, model.grid_width
-        )
-        ego_motions = batch["future_ego_motions"].to(device) / act_scale
-
-        with torch.set_grad_enabled(training):
-            tf_preds, ar_preds = forward_predictions(model, context, ego_motions, future)
-            tf_loss = latent_loss(tf_preds, future)
-            ar_loss = latent_loss(ar_preds, future)
-            loss = tf_loss + ar_loss
-
-        if training:
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            # clip_grad_norm_ returns the pre-clip norm: a free health metric.
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            wandb.log(
-                {
-                    "batch/step": global_step,
-                    "batch/tf": tf_loss.item(),
-                    "batch/ar": ar_loss.item(),
-                    "batch/grad_norm": grad_norm.item(),
-                }
-            )
-            global_step += 1
-
+    for batch in loader:
+        tf_loss, ar_loss = batch_losses(model, batch, device, act_scale)
         tf_total += tf_loss.item()
         ar_total += ar_loss.item()
-
-        if log_every and (step + 1) % log_every == 0:
-            rate = (step + 1) / (time.time() - start)
-            print(
-                f"  [{tag}] step {step + 1}/{len(loader)} | "
-                f"tf {tf_total / (step + 1):.4f} ar {ar_total / (step + 1):.4f} | "
-                f"{rate:.1f} it/s",
-                flush=True,
-            )
-
     n = max(len(loader), 1)
-    return tf_total / n, ar_total / n, global_step
+    return tf_total / n, ar_total / n
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the VJEPA2.1 world model")
-    parser.add_argument("--epochs", type=int, default=50)
+    # Iteration budget (micro-steps = batches), not epochs. The world model has
+    # no prior run to calibrate against, so this is a sensible first budget:
+    # 40k batches of 2 over ~18.9k windows is ~4 effective passes. Watch val/ar
+    # and extend with --max-iters if it is still improving.
+    parser.add_argument("--max-iters", type=int, default=40_000)
+    parser.add_argument("--grad-accum", type=int, default=4)  # eff. batch = grad_accum * batch_size
+    parser.add_argument("--val-every", type=int, default=5_000)
+    parser.add_argument("--warmup-frac", type=float, default=0.03)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
@@ -201,7 +176,7 @@ def main() -> None:
     parser.add_argument("--future-length", type=int, default=2)
     parser.add_argument("--frame-stride", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument(
         "--smoke-test",
         action="store_true",
@@ -236,14 +211,9 @@ def main() -> None:
         },
         mode="disabled" if args.smoke_test else "online",
     )
-    # Epoch metrics plot against `epoch`; batch metrics against their own
-    # counter. Without this, per-batch and per-epoch logs fight over wandb's
-    # global step and the epoch curves come out mangled.
-    wandb.define_metric("epoch")
-    wandb.define_metric("train/*", step_metric="epoch")
-    wandb.define_metric("val/*", step_metric="epoch")
-    wandb.define_metric("batch/step")
-    wandb.define_metric("batch/*", step_metric="batch/step")
+    wandb.define_metric("iter")
+    wandb.define_metric("train/*", step_metric="iter")
+    wandb.define_metric("val/*", step_metric="iter")
 
     model = VJEPA21WorldModel().to(device)
     print(f"parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
@@ -251,71 +221,93 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
+    act_scale = action_scale(loaders.step_seconds).to(device)
 
     if args.smoke_test:
         from itertools import islice
 
-        few = list(islice(loaders.train, 4))
-        run_epoch(
-            model, few, device, loaders.step_seconds, optimizer, log_every=1, tag="smoke"
-        )
-        print("smoke test passed: data loads and a train step runs.")
+        for batch in islice(loaders.train, 4):
+            tf_loss, ar_loss = batch_losses(model, batch, device, act_scale)
+            (tf_loss + ar_loss).backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        print("smoke test passed: data loads and a bf16 train step runs.")
         wandb.finish()
         return
 
+    total_opt_steps = args.max_iters // args.grad_accum
+    scheduler = build_warmup_cosine(optimizer, total_opt_steps, int(args.warmup_frac * total_opt_steps))
+
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-
     best_val_ar = float("inf")
-    global_step = 0
-    for epoch in range(args.epochs):
-        train_tf, train_ar, global_step = run_epoch(
-            model,
-            loaders.train,
-            device,
-            loaders.step_seconds,
-            optimizer,
-            log_every=args.log_every,
-            tag="train",
-            global_step=global_step,
-        )
-        val_tf, val_ar, _ = run_epoch(
-            model, loaders.validation, device, loaders.step_seconds, log_every=0, tag="val"
-        )
 
-        print(
-            f"epoch {epoch:3d} | "
-            f"train tf {train_tf:.4f} ar {train_ar:.4f} | "
-            f"val tf {val_tf:.4f} ar {val_ar:.4f}"
-        )
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/tf": train_tf,
-                "train/ar": train_ar,
-                "val/tf": val_tf,
-                "val/ar": val_ar,
+    train_batches = infinite(loaders.train)
+    tf_running, ar_running = 0.0, 0.0
+    optimizer.zero_grad(set_to_none=True)
+    model.train()
+    start = time.time()
+
+    for iteration in range(1, args.max_iters + 1):
+        batch = next(train_batches)
+        tf_loss, ar_loss = batch_losses(model, batch, device, act_scale)
+        # Total loss = teacher forcing + rollout, scaled by 1/accum for averaging.
+        ((tf_loss + ar_loss) / args.grad_accum).backward()
+
+        grad_norm = None
+        if iteration % args.grad_accum == 0:
+            # clip_grad_norm_ returns the pre-clip norm: a free health metric.
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+
+        tf_running += tf_loss.item()
+        ar_running += ar_loss.item()
+
+        if iteration % args.log_every == 0:
+            rate = iteration / (time.time() - start)
+            log = {
+                "iter": iteration,
+                "train/tf": tf_running / args.log_every,
+                "train/ar": ar_running / args.log_every,
+                "train/lr": scheduler.get_last_lr()[0],
             }
-        )
-
-        # The rollout loss is the one that matters for navigation, so it
-        # selects the checkpoint.
-        if val_ar < best_val_ar:
-            best_val_ar = val_ar
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "epoch": epoch,
-                    "val_ar": val_ar,
-                    # The action normalisation is part of the model contract:
-                    # inference must divide raw ego motion by the same scale.
-                    "max_speed_mps": MAX_SPEED_MPS,
-                    "step_seconds": loaders.step_seconds,
-                },
-                args.checkpoint,
+            if grad_norm is not None:
+                log["train/grad_norm"] = grad_norm.item()
+            print(
+                f"iter {iteration:6d}/{args.max_iters} | "
+                f"tf {log['train/tf']:.4f} ar {log['train/ar']:.4f} | "
+                f"lr {log['train/lr']:.2e} | {rate:.1f} it/s",
+                flush=True,
             )
-            wandb.summary["best_val_ar"] = val_ar
-            wandb.summary["best_epoch"] = epoch
-            print(f"          saved checkpoint (val ar {val_ar:.4f})")
+            wandb.log(log)
+            tf_running, ar_running = 0.0, 0.0
+
+        if iteration % args.val_every == 0 or iteration == args.max_iters:
+            val_tf, val_ar = evaluate(model, loaders.validation, device, loaders.step_seconds)
+            model.train()
+            print(f"  [val] iter {iteration} | tf {val_tf:.4f} ar {val_ar:.4f}", flush=True)
+            wandb.log({"iter": iteration, "val/tf": val_tf, "val/ar": val_ar})
+
+            # The rollout loss is the one that matters for navigation, so it
+            # selects the checkpoint.
+            if val_ar < best_val_ar:
+                best_val_ar = val_ar
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "iteration": iteration,
+                        "val_ar": val_ar,
+                        # The action normalisation is part of the model contract:
+                        # inference must divide raw ego motion by the same scale.
+                        "max_speed_mps": MAX_SPEED_MPS,
+                        "step_seconds": loaders.step_seconds,
+                    },
+                    args.checkpoint,
+                )
+                wandb.summary["best_val_ar"] = val_ar
+                wandb.summary["best_iter"] = iteration
+                print(f"          saved checkpoint (val ar {val_ar:.4f})")
 
     wandb.finish()
 
