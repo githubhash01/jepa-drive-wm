@@ -62,7 +62,11 @@ def main() -> None:
     args = parser.parse_args()
 
     checkpoint = torch.load(args.checkpoint, map_location=DEVICE)
-    model = DepthDecoder().to(DEVICE)
+    config = checkpoint.get("config", {})
+    model = DepthDecoder(
+        bins_strategy=config.get("bins_strategy", "linear"),
+        norm_strategy=config.get("norm_strategy", "linear"),
+    ).to(DEVICE)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     print(f"loaded {args.checkpoint} (iter {checkpoint['iteration']}, "

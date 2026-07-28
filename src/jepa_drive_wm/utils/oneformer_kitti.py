@@ -43,8 +43,8 @@ from tqdm import tqdm
 from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
 
 from jepa_drive_wm.data.kitti import KITTISequence
-# Shared Cityscapes taxonomy (colours + 19->5 planning grouping) lives with the semseg task.
-from jepa_drive_wm.probes.dense.taxonomy import (
+# Shared Cityscapes taxonomy (colours + 19->5 planning grouping) lives with the visualiser.
+from jepa_drive_wm.viz.visualiser import (
     CITYSCAPES, CLASS_NAMES, PALETTE, GROUPS, GROUP_NAMES, GROUP_PALETTE,
     CLASS_TO_GROUP, labels_to_groups,
 )

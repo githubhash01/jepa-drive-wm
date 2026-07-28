@@ -22,6 +22,12 @@ Losses follow https://arxiv.org/pdf/2604.26454:
      patch containing that pixel (tiles are disjoint, so: one patch per scale),
      then averaged over all valid pixels.
 
+  3. Multi-scale gradient matching loss (MiDaS, arXiv 1907.01341 eq. 11),
+     weight GRAD_WEIGHT: L1 on the gradients of the log-depth residual at
+     dyadic strides {1, 2, 4, 8}. SiLog and HN are per-pixel, so a blurred
+     boundary costs them little; this term charges it the full log-depth
+     discontinuity.
+
 The best model (lowest validation loss) is saved to CHECKPOINT_PATH.
 """
 import argparse
@@ -47,8 +53,10 @@ MAX_DEPTH = 80.0
 
 SILOG_LAMBDA = 0.85          # balancing parameter from the paper
 HN_SCALES = (1, 4, 8)        # M: image tiled into an M x M grid per scale
-HN_WEIGHT = 1.0              # total = silog + HN_WEIGHT * hn
+HN_WEIGHT = 1.0              # total = silog + HN_WEIGHT * hn + GRAD_WEIGHT * grad
 HN_MIN_VALID_PER_TILE = 32   # skip tiles with fewer valid pixels (stats too noisy)
+GRAD_SCALES = 4              # dyadic strides 1..8; the stride-8 grid ~ matches the finest HN tile
+GRAD_WEIGHT = 0.5            # MiDaS default alpha
 
 # Iteration budget, not epochs: the proven DPT recipe trained a fixed number of
 # forward/backward passes with a cosine schedule (see training_utils). MAX_ITERS
@@ -149,6 +157,45 @@ def _loss_hn(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> t
     return (loss_sum[counted] / loss_count[counted]).mean()
 
 
+def _loss_grad(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """
+    Multi-scale gradient matching loss (MiDaS, arXiv 1907.01341 eq. 11) on log
+    depth, where a global scale error is a constant offset and vanishes under
+    differencing.
+
+    The residual log(pred) - log(gt) is zeroed at invalid pixels; each scale is
+    a strided subsample (pooling would fabricate intermediate depths across the
+    very boundaries this loss is about). Gradients count only where both
+    neighbours are valid -- zeroing alone would leave a spurious |0 - d| edge
+    along every valid/invalid border.
+    """
+    log_target = torch.where(valid, target, torch.ones_like(target)).log()
+    diff = torch.where(valid, torch.log(pred) - log_target, torch.zeros_like(pred))
+    total = pred.new_zeros(())
+    for k in range(GRAD_SCALES):
+        step = 2**k
+        d, v = diff[::step, ::step], valid[::step, ::step]
+        grad_x = (d[:, 1:] - d[:, :-1]).abs() * (v[:, 1:] & v[:, :-1]).float()
+        grad_y = (d[1:, :] - d[:-1, :]).abs() * (v[1:, :] & v[:-1, :]).float()
+        total = total + (grad_x.sum() + grad_y.sum()) / v.sum().clamp_min(1)
+    return total
+
+
+def _grad_ratio(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """
+    Sharpness probe (eval only): mean |grad log pred| / |grad log gt| over
+    valid pairs. Below 1 means blurrier than the pseudolabel; above 1 means
+    hallucinated texture (a sign GRAD_WEIGHT is too high).
+    """
+    log_pred = torch.log(pred)
+    log_target = torch.where(valid, target, torch.ones_like(target)).log()
+    vx = valid[:, 1:] & valid[:, :-1]
+    vy = valid[1:, :] & valid[:-1, :]
+    pred_mag = (log_pred[:, 1:] - log_pred[:, :-1]).abs()[vx].sum() + (log_pred[1:, :] - log_pred[:-1, :]).abs()[vy].sum()
+    gt_mag = (log_target[:, 1:] - log_target[:, :-1]).abs()[vx].sum() + (log_target[1:, :] - log_target[:-1, :]).abs()[vy].sum()
+    return pred_mag / gt_mag.clamp_min(1e-8)
+
+
 def loss(pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
     """
     Combined loss for one frame. pred and target are [H, W] metric depth.
@@ -157,10 +204,12 @@ def loss(pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
     valid = _valid_mask(target)
     silog = _loss_silog(pred, target, valid)
     hn = _loss_hn(pred, target, valid)
+    grad = _loss_grad(pred, target, valid)
     return {
         "silog": silog,
         "hn": hn,
-        "total": silog + HN_WEIGHT * hn,
+        "grad": grad,
+        "total": silog + HN_WEIGHT * hn + GRAD_WEIGHT * grad,
     }
 
 
@@ -186,7 +235,7 @@ def predict(model: DepthDecoder, features: torch.Tensor, target_shape: tuple[int
 def evaluate(model: DepthDecoder, loader) -> dict[str, float]:
     """Forward-only pass over `loader`; mean loss components plus AbsRel."""
     model.eval()
-    totals = {"silog": 0.0, "hn": 0.0, "total": 0.0, "absrel": 0.0}
+    totals = {"silog": 0.0, "hn": 0.0, "grad": 0.0, "total": 0.0, "absrel": 0.0, "grad_ratio": 0.0}
     n_frames = 0
 
     for batch in loader:
@@ -199,15 +248,23 @@ def evaluate(model: DepthDecoder, loader) -> dict[str, float]:
         valid = _valid_mask(target)
         absrel = ((pred[valid] - target[valid]).abs() / target[valid]).mean()
 
-        for key in ("silog", "hn", "total"):
+        for key in ("silog", "hn", "grad", "total"):
             totals[key] += losses[key].item()
         totals["absrel"] += absrel.item()
+        totals["grad_ratio"] += _grad_ratio(pred, target, valid).item()
         n_frames += 1
 
     return {key: value / max(n_frames, 1) for key, value in totals.items()}
 
 
-def save_checkpoint(model: DepthDecoder, iteration: int, metrics: dict[str, float], path: Path) -> None:
+def save_checkpoint(
+    model: DepthDecoder,
+    iteration: int,
+    metrics: dict[str, float],
+    path: Path,
+    bins_strategy: str,
+    norm_strategy: str,
+) -> None:
     torch.save(
         {
             "iteration": iteration,
@@ -219,6 +276,12 @@ def save_checkpoint(model: DepthDecoder, iteration: int, metrics: dict[str, floa
                 "silog_lambda": SILOG_LAMBDA,
                 "hn_scales": HN_SCALES,
                 "hn_weight": HN_WEIGHT,
+                "grad_scales": GRAD_SCALES,
+                "grad_weight": GRAD_WEIGHT,
+                # The state dict is shape-identical across strategies, so this
+                # config entry is the only record of which readout was trained.
+                "bins_strategy": bins_strategy,
+                "norm_strategy": norm_strategy,
             },
         },
         path,
@@ -235,6 +298,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--warmup-frac", type=float, default=WARMUP_FRAC)
+    parser.add_argument("--bins-strategy", choices=["linear", "log"], default="linear")
+    parser.add_argument("--norm-strategy", choices=["linear", "softmax"], default="linear")
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
     args = parser.parse_args()
 
@@ -266,6 +331,10 @@ def main() -> None:
             "hn_scales": HN_SCALES,
             "hn_weight": HN_WEIGHT,
             "hn_min_valid_per_tile": HN_MIN_VALID_PER_TILE,
+            "grad_scales": GRAD_SCALES,
+            "grad_weight": GRAD_WEIGHT,
+            "bins_strategy": args.bins_strategy,
+            "norm_strategy": args.norm_strategy,
             "train_sequences": TRAIN_SEQUENCES,
             "validation_sequences": VALIDATION_SEQUENCES,
             "test_sequences": TEST_SEQUENCES,
@@ -275,7 +344,7 @@ def main() -> None:
     wandb.define_metric("train/*", step_metric="iter")
     wandb.define_metric("val/*", step_metric="iter")
 
-    model = DepthDecoder().to(DEVICE)
+    model = DepthDecoder(bins_strategy=args.bins_strategy, norm_strategy=args.norm_strategy).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_warmup_cosine(optimizer, total_opt_steps, int(args.warmup_frac * total_opt_steps))
 
@@ -283,7 +352,7 @@ def main() -> None:
     best_validation_loss = float("inf")
 
     train_batches = infinite(loaders.train)
-    running = {"silog": 0.0, "hn": 0.0, "total": 0.0}
+    running = {"silog": 0.0, "hn": 0.0, "grad": 0.0, "total": 0.0}
     optimizer.zero_grad(set_to_none=True)
     model.train()
     start = time.time()
@@ -312,7 +381,7 @@ def main() -> None:
             running = {key: 0.0 for key in running}
             print(
                 f"iter {iteration:6d}/{args.max_iters} | total {means['total']:.4f} "
-                f"(silog {means['silog']:.4f}, hn {means['hn']:.4f}) | "
+                f"(silog {means['silog']:.4f}, hn {means['hn']:.4f}, grad {means['grad']:.4f}) | "
                 f"lr {scheduler.get_last_lr()[0]:.2e} | {rate:.1f} it/s",
                 flush=True,
             )
@@ -322,6 +391,7 @@ def main() -> None:
                     "train/total": means["total"],
                     "train/silog": means["silog"],
                     "train/hn": means["hn"],
+                    "train/grad": means["grad"],
                     "train/lr": scheduler.get_last_lr()[0],
                 }
             )
@@ -331,7 +401,8 @@ def main() -> None:
             model.train()
             print(
                 f"  [val] iter {iteration} | total {validation_metrics['total']:.4f} "
-                f"absrel {validation_metrics['absrel']:.4f}",
+                f"absrel {validation_metrics['absrel']:.4f} "
+                f"grad_ratio {validation_metrics['grad_ratio']:.4f}",
                 flush=True,
             )
             wandb.log(
@@ -340,12 +411,15 @@ def main() -> None:
                     "val/total": validation_metrics["total"],
                     "val/silog": validation_metrics["silog"],
                     "val/hn": validation_metrics["hn"],
+                    "val/grad": validation_metrics["grad"],
                     "val/absrel": validation_metrics["absrel"],
+                    "val/grad_ratio": validation_metrics["grad_ratio"],
                 }
             )
             if validation_metrics["total"] < best_validation_loss:
                 best_validation_loss = validation_metrics["total"]
-                save_checkpoint(model, iteration, validation_metrics, args.checkpoint)
+                save_checkpoint(model, iteration, validation_metrics, args.checkpoint,
+                                args.bins_strategy, args.norm_strategy)
                 wandb.summary["best_val_total"] = validation_metrics["total"]
                 wandb.summary["best_val_absrel"] = validation_metrics["absrel"]
                 wandb.summary["best_iter"] = iteration
@@ -359,7 +433,9 @@ def main() -> None:
             "test/total": test_metrics["total"],
             "test/silog": test_metrics["silog"],
             "test/hn": test_metrics["hn"],
+            "test/grad": test_metrics["grad"],
             "test/absrel": test_metrics["absrel"],
+            "test/grad_ratio": test_metrics["grad_ratio"],
         }
     )
     wandb.finish()

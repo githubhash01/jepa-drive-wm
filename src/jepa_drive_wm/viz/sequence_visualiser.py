@@ -40,7 +40,7 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 
 from jepa_drive_wm.data.kitti import KITTISequence
-from jepa_drive_wm.probes.dense.taxonomy import CLASS_TO_GROUP, GROUP_PALETTE
+from jepa_drive_wm.viz.visualiser import CLASS_TO_GROUP, GROUP_PALETTE
 from jepa_drive_wm.viz.bev_map import BEVMapper
 
 

@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from jepa_drive_wm.lift_splat.lift_splat import LiftSplat
-from jepa_drive_wm.probes.dense.taxonomy import (
+from jepa_drive_wm.viz.visualiser import (
     CLASS_TO_GROUP, GROUP_NAMES, GROUP_PALETTE, NUM_GROUPS,
 )
 
