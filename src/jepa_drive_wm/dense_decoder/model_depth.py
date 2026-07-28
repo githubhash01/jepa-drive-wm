@@ -6,10 +6,12 @@ from jepa_drive_wm.dense_decoder.final_dpt import FinalFeatureDPT
 # DepthHead
 class DepthDecoder(nn.Module):
 
-    def __init__(self, embed_dim: int = 768):  
+    def __init__(self, embed_dim: int = 768, bins_strategy: str = "linear", norm_strategy: str = "linear"):
         super().__init__()
-        
-        # Repeated DPTHead for depth prediction, followed by FeaturesToDepth for depth binning and normalization
+
+        # Repeated DPTHead for depth prediction, followed by FeaturesToDepth for depth binning and normalization.
+        # The strategies add no parameters, so the state dict is identical across them:
+        # a checkpoint must be loaded with the strategies it was trained under (saved in its config).
         self.depth_model = nn.Sequential(
             FinalFeatureDPT(
                 embed_dim=embed_dim,
@@ -17,7 +19,9 @@ class DepthDecoder(nn.Module):
             ),
             FeaturesToDepth(
                 min_depth=0.5,
-                max_depth=80.0
+                max_depth=80.0,
+                bins_strategy=bins_strategy,
+                norm_strategy=norm_strategy,
             ),
         )
     
