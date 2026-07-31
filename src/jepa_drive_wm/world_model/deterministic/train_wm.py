@@ -27,8 +27,8 @@ from torch import Tensor
 
 from jepa_drive_wm.paths import OUTPUTS_DIR
 from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite
-from jepa_drive_wm.world_model.data_interface_wm import KITTIRolloutLoaders
-from jepa_drive_wm.world_model.model import VJEPA21WorldModel
+from jepa_drive_wm.world_model.deterministic.data_interface_wm import KITTIRolloutLoaders
+from jepa_drive_wm.world_model.deterministic.model import VJEPA21WorldModel
 
 # Speed ceiling used to normalise per-step translation. Generous for road
 # vehicles (~90 mph); KITTI's fastest highway stretches reach ~34 m/s.
