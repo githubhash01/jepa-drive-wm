@@ -10,6 +10,7 @@ wandb/
 src/jepa_drive_wm/probes/semantics/preds/
 # migration / vendored-vjepa2 hygiene
 dataset/
+outputs/
 vjepa2/model_checkpoints/
 vjepa2/.git-backup/
 vjepa2/wget-log
