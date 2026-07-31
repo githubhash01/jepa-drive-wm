@@ -10,17 +10,18 @@ world model built on them can be action-conditional in a meaningful way.
 Recipe
 - Same window machinery and splits as the world model: KITTIRolloutLoaders
   with context_length=1, future_length=k, frame_stride=5 (0.5 s steps).
-- Step 1, training-set action statistics: per-component mean/std over every
-  stride-step of the training sequences. Standardising with them keeps the
-  dominant forward translation from swamping left/yaw in the loss.
+- Step 1, training-set action statistics: per-component mean/std/median over
+  every stride-step of the training sequences. Standardising with mean/std
+  keeps the dominant forward translation from swamping left/yaw in the loss.
 - Step 2, train the IDM (patch_size=3 over the 24x78 token grid to keep the
-  parameter count down) with L1 in standardised action space; best model by
-  validation loss. Intended horizons: k=1 and k=4 (--horizon).
+  parameter count down) with Smooth-L1 in standardised action space; best
+  model by validation loss. Intended horizons: k=1 and k=4 (--horizon).
 
 Reported per component, on the test sequences:
     MAE (metres for forward/left, degrees for yaw), R^2 (primary),
-    Pearson r (secondary) -- each against the mean-motion baseline that
-    predicts the training-set mean everywhere. Success = beating it.
+    Pearson r (secondary). Each baseline predicts a training-set constant --
+    the one optimal for its metric: the median for MAE, the mean for R^2.
+    Success = beating both.
 
 Run:
     python -m jepa_drive_wm.evals.action_recoverability.action_recoverablity --horizon 1
@@ -64,11 +65,12 @@ DISPLAY_SCALE = {"forward": 1.0, "left": 1.0, "yaw": math.degrees(1.0)}
 
 # ----------------------------------------------------------------------------- step 1: statistics
 
-def action_statistics(dataset: KITTIRolloutDataset) -> tuple[np.ndarray, np.ndarray]:
+def action_statistics(dataset: KITTIRolloutDataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Per-component mean/std of one-step ego motion, over every stride-step of the
-    dataset's sequences -- exactly the support of the training windows' actions.
-    Used to standardise the regression and as the mean-motion baseline.
+    Per-component mean/std/median of one-step ego motion, over every stride-step
+    of the dataset's sequences -- exactly the support of the training windows'
+    actions. Mean/std standardise the regression; median and mean are the
+    constant baselines for MAE and R^2 respectively.
     """
     stride = dataset.frame_stride
     actions = np.array(
@@ -79,7 +81,11 @@ def action_statistics(dataset: KITTIRolloutDataset) -> tuple[np.ndarray, np.ndar
         ],
         dtype=np.float64,
     )
-    return actions.mean(axis=0).astype(np.float32), actions.std(axis=0).astype(np.float32)
+    return (
+        actions.mean(axis=0).astype(np.float32),
+        actions.std(axis=0).astype(np.float32),
+        np.median(actions, axis=0).astype(np.float32),
+    )
 
 
 # ----------------------------------------------------------------------------- model io
@@ -110,12 +116,19 @@ def run_inference(model, loader, mean: torch.Tensor, std: torch.Tensor) -> tuple
 
 # ----------------------------------------------------------------------------- metrics
 
+def smooth_l1(error: np.ndarray, beta: float = 1.0) -> float:
+    """Mean Smooth-L1 (Huber-like, matching F.smooth_l1_loss) of an error array."""
+    absolute = np.abs(error)
+    return float(np.where(absolute < beta, 0.5 * absolute**2 / beta, absolute - 0.5 * beta).mean())
+
+
 def metrics_report(predictions: np.ndarray, ground_truth: np.ndarray,
-                   train_mean: np.ndarray) -> dict[str, dict[str, float]]:
+                   train_mean: np.ndarray, train_median: np.ndarray) -> dict[str, dict[str, float]]:
     """
-    Per-component MAE / R^2 / Pearson r for the IDM and for the mean-motion
-    baseline (predicting the training mean everywhere). All chunk steps are
-    pooled; values in raw units (metres / radians).
+    Per-component MAE / R^2 / Pearson r for the IDM and for the constant
+    baselines: training median for MAE (its optimal constant), training mean
+    for R^2 (likewise). All chunk steps are pooled; values in raw units
+    (metres / radians).
     """
     predictions = predictions.reshape(-1, 3).astype(np.float64)
     ground_truth = ground_truth.reshape(-1, 3).astype(np.float64)
@@ -124,13 +137,14 @@ def metrics_report(predictions: np.ndarray, ground_truth: np.ndarray,
     for component, name in enumerate(COMPONENT_NAMES):
         predicted = predictions[:, component]
         actual = ground_truth[:, component]
-        baseline = float(train_mean[component])
+        mean_baseline = float(train_mean[component])
+        median_baseline = float(train_median[component])
         total_ss = ((actual - actual.mean()) ** 2).sum()
         report[name] = {
             "mae": float(np.abs(predicted - actual).mean()),
-            "baseline_mae": float(np.abs(baseline - actual).mean()),
+            "baseline_mae": float(np.abs(median_baseline - actual).mean()),
             "r2": float(1.0 - ((actual - predicted) ** 2).sum() / total_ss),
-            "baseline_r2": float(1.0 - ((actual - baseline) ** 2).sum() / total_ss),
+            "baseline_r2": float(1.0 - ((actual - mean_baseline) ** 2).sum() / total_ss),
             "pearson": float(np.corrcoef(predicted, actual)[0, 1]),
         }
     return report
@@ -145,11 +159,17 @@ def print_report(report: dict[str, dict[str, float]]) -> None:
             f"{metrics['baseline_mae'] * scale:>10.4f} {unit:<3} "
             f"{metrics['r2']:>8.4f} {metrics['baseline_r2']:>9.4f} {metrics['pearson']:>8.4f}"
         )
-    if all(metrics["mae"] < metrics["baseline_mae"] for metrics in report.values()):
-        print("\nsuccess: beats the mean-motion baseline on every component")
+    if all(
+        metrics["mae"] < metrics["baseline_mae"] and metrics["r2"] > metrics["baseline_r2"]
+        for metrics in report.values()
+    ):
+        print("\nsuccess: beats the constant baselines on every component")
     else:
-        losing = [n for n, m in report.items() if m["mae"] >= m["baseline_mae"]]
-        print(f"\nFAILURE: does not beat the mean-motion baseline on: {', '.join(losing)}")
+        losing = [
+            name for name, metrics in report.items()
+            if metrics["mae"] >= metrics["baseline_mae"] or metrics["r2"] <= metrics["baseline_r2"]
+        ]
+        print(f"\nFAILURE: does not beat the constant baselines on: {', '.join(losing)}")
 
 
 # ----------------------------------------------------------------------------- main
@@ -202,19 +222,24 @@ def main() -> None:
               f"val loss {checkpoint['validation_metrics']['loss']:.4f})")
         train_mean = np.array(config["action_mean"], dtype=np.float32)
         train_std = np.array(config["action_std"], dtype=np.float32)
+        if "action_median" in config:
+            train_median = np.array(config["action_median"], dtype=np.float32)
+        else:  # checkpoint predates the median baseline: recompute (reporting only)
+            _, _, train_median = action_statistics(loaders.train_dataset)
         mean = torch.tensor(train_mean, device=DEVICE)
         std = torch.tensor(train_std, device=DEVICE)
         predictions, ground_truth = run_inference(model, loaders.test, mean, std)
-        print_report(metrics_report(predictions, ground_truth, train_mean))
+        print_report(metrics_report(predictions, ground_truth, train_mean, train_median))
         return
 
     # Step 1: training-set statistics. Printing them makes the imbalance the
     # standardisation corrects for visible (forward >> left, yaw).
-    train_mean, train_std = action_statistics(loaders.train_dataset)
+    train_mean, train_std, train_median = action_statistics(loaders.train_dataset)
     for component, name in enumerate(COMPONENT_NAMES):
         scale, unit = DISPLAY_SCALE[name], DISPLAY_UNIT[name]
         print(f"train action stats | {name:<8} mean {train_mean[component] * scale:>8.4f} {unit:<3} "
-              f"std {train_std[component] * scale:>8.4f} {unit}")
+              f"std {train_std[component] * scale:>8.4f} {unit:<3} "
+              f"median {train_median[component] * scale:>8.4f} {unit}")
     mean = torch.tensor(train_mean, device=DEVICE)
     std = torch.tensor(train_std, device=DEVICE)
 
@@ -227,13 +252,14 @@ def main() -> None:
             "step_seconds": loaders.step_seconds,
             "action_mean": train_mean.tolist(),
             "action_std": train_std.tolist(),
+            "action_median": train_median.tolist(),
         },
     )
     wandb.define_metric("iter")
     wandb.define_metric("train/*", step_metric="iter")
     wandb.define_metric("val/*", step_metric="iter")
 
-    # Step 2: train the IDM with standardised L1.
+    # Step 2: train the IDM with standardised Smooth-L1.
     model = create_idm(
         feature_dim=VJEPA_BASE_EMBED_DIM,
         spatial_h=GRID_H,
@@ -264,7 +290,7 @@ def main() -> None:
 
         with autocast(DEVICE):
             predicted = model(latents)  # [B, k, 3] standardised
-        loss = F.l1_loss(predicted.float(), target)
+        loss = F.smooth_l1_loss(predicted.float(), target)
         (loss / args.grad_accum).backward()
 
         if iteration % args.grad_accum == 0:
@@ -292,8 +318,8 @@ def main() -> None:
         if iteration % args.val_every == 0 or iteration == args.max_iters:
             predictions, ground_truth = run_inference(model, loaders.validation, mean, std)
             model.train()
-            # Same quantity as the training loss: L1 in standardised action space.
-            validation_loss = float(np.abs((predictions - ground_truth) / train_std).mean())
+            # Same quantity as the training loss: Smooth-L1 in standardised action space.
+            validation_loss = smooth_l1((predictions - ground_truth) / train_std)
             print(f"  [val] iter {iteration} | loss {validation_loss:.4f}", flush=True)
             wandb.log({"iter": iteration, "val/loss": validation_loss})
             if validation_loss < best_validation_loss:
@@ -312,6 +338,7 @@ def main() -> None:
                             "grid_hw": list(VJEPA_BASE_GRID_HW),
                             "action_mean": train_mean.tolist(),
                             "action_std": train_std.tolist(),
+                            "action_median": train_median.tolist(),
                         },
                     },
                     checkpoint_path,
@@ -323,7 +350,7 @@ def main() -> None:
     # Test with the best-validation model, not whatever the last iteration left.
     model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE)["model_state_dict"])
     predictions, ground_truth = run_inference(model, loaders.test, mean, std)
-    report = metrics_report(predictions, ground_truth, train_mean)
+    report = metrics_report(predictions, ground_truth, train_mean, train_median)
     print_report(report)
     # Single points, not curves: they belong in the summary, not the timeline.
     wandb.summary.update({
