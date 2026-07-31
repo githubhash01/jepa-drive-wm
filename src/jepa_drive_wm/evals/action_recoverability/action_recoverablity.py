@@ -177,7 +177,7 @@ def print_report(report: dict[str, dict[str, float]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Probe ego-motion recoverability from V-JEPA features")
     parser.add_argument("--horizon", type=int, default=1, help="action chunk length k (plan: 1 and 4)")
-    parser.add_argument("--max-iters", type=int, default=20_000)
+    parser.add_argument("--max-iters", type=int, default=15_000)
     parser.add_argument("--grad-accum", type=int, default=1)  # eff. batch = grad_accum * batch_size
     parser.add_argument("--val-every", type=int, default=2_000)
     parser.add_argument("--log-every", type=int, default=100)
@@ -187,7 +187,7 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-frac", type=float, default=0.03)
     parser.add_argument("--frame-stride", type=int, default=5)
-    parser.add_argument("--patch-size", type=int, default=3)
+    parser.add_argument("--patch-size", type=int, default=1)
     parser.add_argument("--checkpoint", type=Path, default=None,
                         help="defaults to checkpoints_idm/idm_k<horizon>_best.pt")
     parser.add_argument("--eval-only", action="store_true",
