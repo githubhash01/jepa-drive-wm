@@ -27,8 +27,8 @@ from torch import Tensor
 
 from jepa_drive_wm.paths import OUTPUTS_DIR
 from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite
-from jepa_drive_wm.world_model.deterministic.data_interface_wm import KITTIRolloutLoaders
-from jepa_drive_wm.world_model.deterministic.model import VJEPA21WorldModel
+from jepa_drive_wm.world_model.first_attempt.data_interface_wm import KITTIRolloutLoaders
+from jepa_drive_wm.world_model.first_attempt.model import VJEPA21WorldModel
 
 # Speed ceiling used to normalise per-step translation. Generous for road
 # vehicles (~90 mph); KITTI's fastest highway stretches reach ~34 m/s.
@@ -36,14 +36,14 @@ MAX_SPEED_MPS = 40.0
 
 
 def action_scale(step_seconds: float) -> torch.Tensor:
-    """Per-step normalisation for raw ego motion (dx, dy, yaw).
+    """Per-step normalisation for raw ego motion (forward, right, yaw_right).
 
     The Fourier action embedder (frequencies 2^k * pi) is exactly periodic
     with period 2 in its input, so inputs outside one period alias onto each
     other. Dividing translation by (MAX_SPEED_MPS * step_seconds) guarantees
-    |dx|, |dy| <= 1 for any vehicle obeying the speed ceiling -- always within
-    one period, never aliasing -- and typical steps land well inside +-0.5,
-    where the coarsest band is monotonic.
+    |forward|, |right| <= 1 for any vehicle obeying the speed ceiling -- always
+    within one period, never aliasing -- and typical steps land well inside
+    +-0.5, where the coarsest band is monotonic.
 
     Yaw is divided by pi, mapping [-pi, pi] onto one full embedding period so
     the embedding's wraparound coincides with the physical wraparound: a yaw

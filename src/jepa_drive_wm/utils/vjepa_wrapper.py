@@ -216,8 +216,7 @@ class VJEPA21Wrapper:
             num_frames=self.num_frames,
             tubelet_size=self.tubelet_size,
             use_sdpa=True,
-            use_SiLU=False,
-            wide_SiLU=True,
+            use_silu=False,
             uniform_power=False,
             use_rope=True,
             img_temporal_dim_size=1,   # B C 1 H W routes to image patch-embed

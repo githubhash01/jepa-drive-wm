@@ -34,9 +34,9 @@ from jepa_drive_wm.dense_decoder.train_semantics import (
 from jepa_drive_wm.paths import OUTPUTS_DIR
 from jepa_drive_wm.training_utils import autocast
 from jepa_drive_wm.viz.visualiser import class_colors
-from jepa_drive_wm.world_model.deterministic.data_interface_wm import KITTIRolloutDataset
-from jepa_drive_wm.world_model.deterministic.model import VJEPA21WorldModel
-from jepa_drive_wm.world_model.deterministic.train_wm import MAX_SPEED_MPS, action_scale, latent_loss, to_grid
+from jepa_drive_wm.world_model.first_attempt.data_interface_wm import KITTIRolloutDataset
+from jepa_drive_wm.world_model.first_attempt.model import VJEPA21WorldModel
+from jepa_drive_wm.world_model.first_attempt.train_wm import MAX_SPEED_MPS, action_scale, latent_loss, to_grid
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
