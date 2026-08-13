@@ -88,6 +88,9 @@ class ViTG_Latent_Video_Builder:
             self._wrapper = VJEPA21Wrapper(
                 size=VJEPA21Size.GIGANTIC,   # ViT-G teacher, 1664-d
                 num_frames=2,
+                # The ViT-G checkpoint has no 'ema_encoder' key, only 'encoder'
+                # and 'target_encoder'; the target encoder is the EMA teacher.
+                encoder_key="target_encoder",
             )
             self._wrapper.free_checkpoint_cache()
         return self._wrapper
