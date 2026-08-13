@@ -23,14 +23,15 @@ The latents land next to the other per-sequence caches:
         image_2/            000000.png ...
         vjepa_vitG_video/                   <- created here
             000000.npy      (24, 78, 1664)  V_0 = E(I_0, I_5)
-            000005.npy      (24, 78, 1664)  V_5 = E(I_5, I_10)
+            000001.npy      (24, 78, 1664)  V_1 = E(I_1, I_6)
             ...
             _metadata.json
 
-File NNNNNN.npy encodes frames (NNNNNN, NNNNNN + stride). KITTI runs at
-10 Hz, so the default stride of 5 frames is dt = 0.5 s, and pairs tile the
-sequence back-to-back as a 2 Hz latent stream. Existing files are skipped,
-so a killed run just resumes where it left off.
+File NNNNNN.npy encodes frames (NNNNNN, NNNNNN + timestep). KITTI runs at
+10 Hz, so the default timestep of 5 frames is dt = 0.5 s. Every frame with a
+partner timestep frames ahead gets a latent, so the cache is dense: one file
+per frame except the last `timestep` of each sequence. Existing files are
+skipped, so a killed run just resumes where it left off.
 
 Needs a GPU that can hold ViT-G — run this on the workstation, not the laptop:
 
@@ -51,9 +52,9 @@ from jepa_drive_wm.utils.vjepa_wrapper import VJEPA21Size, VJEPA21Wrapper
 class ViTG_Latent_Video_Builder:
     """Builds the vjepa_vitG_video cache for KITTI sequences.
 
-    stride      frame gap inside a pair (5 frames = 0.5 s at 10 Hz); also the
-                step between pair start frames, so pairs tile back-to-back.
-    save_dtype  on-disk dtype of the .npy files (fp16 halves the ~270 GB a
+    timestep    frame gap inside a pair (5 frames = 0.5 s at 10 Hz). Every
+                frame that has a partner `timestep` ahead gets a latent.
+    save_dtype  on-disk dtype of the .npy files (fp16 halves the ~540 GB a
                 dense fp32 cache would take).
     batch_size  frame pairs per encoder forward pass; drop to 1 on OOM.
     overwrite   re-encode pairs whose .npy already exists.
@@ -63,14 +64,14 @@ class ViTG_Latent_Video_Builder:
 
     def __init__(
         self,
-        stride: int = 5,
+        timestep: int = 5,
         save_dtype: np.dtype = np.float16,
         batch_size: int = 2,
         overwrite: bool = False,
     ) -> None:
-        if stride < 1:
-            raise ValueError("stride must be >= 1")
-        self.stride = stride
+        if timestep < 1:
+            raise ValueError("timestep must be >= 1")
+        self.timestep = timestep
         self.save_dtype = np.dtype(save_dtype)
         self.batch_size = batch_size
         self.overwrite = overwrite
@@ -101,7 +102,7 @@ class ViTG_Latent_Video_Builder:
         return self.wrapper.layout(num_frames=2)
 
     def encode_pairs(self, pairs: list[tuple[str, str]]) -> torch.Tensor:
-        """Encode (I_t, I_{t+stride}) image-path pairs as joint 2-frame clips.
+        """Encode (I_t, I_{t+timestep}) image-path pairs as joint 2-frame clips.
 
         Returns (B, grid_h, grid_w, embed_dim) on cpu — with tubelet_size = 2
         each pair collapses into a single temporal token slice.
@@ -122,9 +123,9 @@ class ViTG_Latent_Video_Builder:
     # Building
     # ------------------------------------------------------------------
     def pair_starts(self, seq: KITTISequence) -> list[int]:
-        """Start frames of the pairs to encode: every `stride` frames, keeping
-        only starts whose partner frame still exists."""
-        return list(range(0, len(seq) - self.stride, self.stride))
+        """Start frames of the pairs to encode: every frame whose partner
+        `timestep` frames ahead still exists."""
+        return list(range(0, len(seq) - self.timestep))
 
     def build_sequence(self, sequence_nr: int) -> None:
         """Encode and cache every frame pair of one KITTI sequence."""
@@ -145,7 +146,7 @@ class ViTG_Latent_Video_Builder:
         start = time.perf_counter()
         for b in range(0, len(todo), self.batch_size):
             batch = todo[b : b + self.batch_size]
-            pairs = [(seq.left_images[i], seq.left_images[i + self.stride]) for i in batch]
+            pairs = [(seq.left_images[i], seq.left_images[i + self.timestep]) for i in batch]
             latents = self.encode_pairs(pairs)
             for i, latent in zip(batch, latents):
                 np.save(out_dir / f"{i:06d}.npy", latent.numpy().astype(self.save_dtype, copy=False))
@@ -175,15 +176,15 @@ class ViTG_Latent_Video_Builder:
         meta = self.wrapper.metadata()
         meta["layout"] = vars(lay)
         meta["save_dtype"] = self.save_dtype.name
-        meta["stride_frames"] = self.stride
+        meta["timestep_frames"] = self.timestep
         meta["array_shape"] = [lay.grid_h, lay.grid_w, lay.embed_dim]
-        meta["pair_convention"] = "file NNNNNN.npy encodes frames (NNNNNN, NNNNNN + stride_frames)"
+        meta["pair_convention"] = "file NNNNNN.npy encodes frames (NNNNNN, NNNNNN + timestep_frames)"
         (out_dir / "_metadata.json").write_text(json.dumps(meta, indent=2))
 
 
-def build_all_video_latents(stride: int = 5, save_dtype: np.dtype = np.float16) -> None:
+def build_all_video_latents(timestep: int = 5, save_dtype: np.dtype = np.float16) -> None:
     """Build the ViT-G video latent cache for all 22 KITTI odometry sequences."""
-    builder = ViTG_Latent_Video_Builder(stride=stride, save_dtype=save_dtype)
+    builder = ViTG_Latent_Video_Builder(timestep=timestep, save_dtype=save_dtype)
     builder.build_all()
 
 
