@@ -231,7 +231,7 @@ def main() -> None:
 
     # Expected:
     # context_latents:    [B, 4, N, D]
-    # future_ego_motions: [B, 2, 3]     -- [forward, left, yaw] per future step
+    # future_ego_motions: [B, 2, 3]     -- [forward, right, yaw_right] per future step
     # future_latents:     [B, 2, N, D]
 
 

@@ -155,15 +155,18 @@ class KITTISequence:
     
     def get_ego_motion(self, i: int, j: int) -> np.ndarray:
         """
-        Ego motion from frame i to frame j as [forward, left, yaw], in metres and
-        radians, expressed in the left camera's frame at time i: "from where the car
-        is at i, it travels `forward` ahead and `left` sideways, turning by `yaw`".
+        Ego motion from frame i to frame j as [forward, right, yaw_right], in
+        metres and radians, expressed in the left camera's frame at time i:
+        "from where the car is at i, it travels `forward` ahead and `right`
+        sideways, turning by `yaw_right` clockwise viewed from above".
         get_ego_motion(i, i) is zero.
 
-        KITTI's rectified camera axes are x=right, y=down, z=forward, so the vehicle
-        ground plane is spanned by z and -x, and vehicle yaw is rotation about -y.
-        The returned triple is therefore the usual right-handed vehicle convention,
-        with yaw positive for a left turn.
+        The triple reads directly off KITTI's rectified camera axes:
+            forward   = +z
+            right     = +x
+            yaw_right = positive rotation about +y (down)
+        so [1.0, 1.0, 1.0] means: 1 m forward, 1 m right, and a 1 rad right
+        turn. No sign flips relative to the camera frame.
         """
         # T_c2i_c2j maps points from frame j into frame i, so its translation column
         # is where the camera at time j sits as seen from time i -- the displacement
@@ -171,10 +174,11 @@ class KITTISequence:
         T_c2i_c2j = self.get_camera_se3(j, i).numpy()
 
         forward = T_c2i_c2j[2, 3]
-        left = -T_c2i_c2j[0, 3]
-        # Rotation about the camera's y (down) axis, negated so left turns are positive.
-        yaw = -np.arctan2(T_c2i_c2j[0, 2], T_c2i_c2j[2, 2])
-        return np.array([forward, left, yaw], dtype=np.float32)
+        right = T_c2i_c2j[0, 3]
+        # Heading of the camera at j seen from i: rotation about +y (down) turns
+        # +z toward +x, so positive yaw is a right turn viewed from above.
+        yaw_right = np.arctan2(T_c2i_c2j[0, 2], T_c2i_c2j[2, 2])
+        return np.array([forward, right, yaw_right], dtype=np.float32)
 
     def get_camera_se3(self, i: int, j: int) -> torch.Tensor:
         """

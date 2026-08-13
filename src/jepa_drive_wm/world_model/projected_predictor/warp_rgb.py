@@ -382,12 +382,12 @@ if __name__ == "__main__":
     # then render that point cloud from each proposed future pose.
     # -------------------------------------------------------------
 
-    N_OBSERVED = 4
+    N_OBSERVED = 2
     N_FUTURE = 4
     FRAME_STRIDE = 5
 
-    sequence = KITTISequence(sequence_nr=9)
-    frame_ids = [360 + FRAME_STRIDE * i for i in range(N_OBSERVED + N_FUTURE)]
+    sequence = KITTISequence(sequence_nr=16)
+    frame_ids = [200 + FRAME_STRIDE * i for i in range(N_OBSERVED + N_FUTURE)]
     observed_ids = frame_ids[:N_OBSERVED]
     future_ids = frame_ids[N_OBSERVED:]
     source_id = observed_ids[-1]

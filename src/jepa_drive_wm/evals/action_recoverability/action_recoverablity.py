@@ -3,7 +3,7 @@ Probe how much ego motion is recoverable from frozen, cached V-JEPA 2.1 features
 
 An inverse dynamics model (TransformerIDM, idm.py) sees k+1 latent frames
 spanning k action steps and regresses the k ego-motion actions
-[forward (m), left (m), yaw (rad)] between them. If the frozen features carry
+[forward (m), right (m), yaw_right (rad)] between them. If the frozen features carry
 the geometry, a small probe should recover the actions; if they don't, no
 world model built on them can be action-conditional in a meaningful way.
 
@@ -12,13 +12,13 @@ Recipe
   with context_length=1, future_length=k, frame_stride=5 (0.5 s steps).
 - Step 1, training-set action statistics: per-component mean/std/median over
   every stride-step of the training sequences. Standardising with mean/std
-  keeps the dominant forward translation from swamping left/yaw in the loss.
+  keeps the dominant forward translation from swamping right/yaw in the loss.
 - Step 2, train the IDM (patch_size=3 over the 24x78 token grid to keep the
   parameter count down) with Smooth-L1 in standardised action space; best
   model by validation loss. Intended horizons: k=1 and k=4 (--horizon).
 
 Reported per component, on the test sequences:
-    MAE (metres for forward/left, degrees for yaw), R^2 (primary),
+    MAE (metres for forward/right, degrees for yaw), R^2 (primary),
     Pearson r (secondary). Each baseline predicts a training-set constant --
     the one optimal for its metric: the median for MAE, the mean for R^2.
     Success = beating both.
@@ -42,7 +42,7 @@ from jepa_drive_wm.data.kitti import VJEPA_BASE_EMBED_DIM, VJEPA_BASE_GRID_HW
 from jepa_drive_wm.evals.action_recoverability.idm import create_idm
 from jepa_drive_wm.paths import OUTPUTS_DIR
 from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite
-from jepa_drive_wm.world_model.deterministic.data_interface_wm import (
+from jepa_drive_wm.world_model.first_attempt.data_interface_wm import (
     KITTIRolloutDataset,
     KITTIRolloutLoaders,
 )
@@ -58,9 +58,9 @@ TEST_SEQUENCES = [4, 9]
 
 GRID_H, GRID_W = VJEPA_BASE_GRID_HW
 
-COMPONENT_NAMES = ("forward", "left", "yaw")
-DISPLAY_UNIT = {"forward": "m", "left": "m", "yaw": "deg"}
-DISPLAY_SCALE = {"forward": 1.0, "left": 1.0, "yaw": math.degrees(1.0)}
+COMPONENT_NAMES = ("forward", "right", "yaw_right")
+DISPLAY_UNIT = {"forward": "m", "right": "m", "yaw_right": "deg"}
+DISPLAY_SCALE = {"forward": 1.0, "right": 1.0, "yaw_right": math.degrees(1.0)}
 
 
 # ----------------------------------------------------------------------------- step 1: statistics
@@ -233,7 +233,7 @@ def main() -> None:
         return
 
     # Step 1: training-set statistics. Printing them makes the imbalance the
-    # standardisation corrects for visible (forward >> left, yaw).
+    # standardisation corrects for visible (forward >> right, yaw).
     train_mean, train_std, train_median = action_statistics(loaders.train_dataset)
     for component, name in enumerate(COMPONENT_NAMES):
         scale, unit = DISPLAY_SCALE[name], DISPLAY_UNIT[name]

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 # _IDM_ACTION_DIM = 7  # pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, gripper
 
-_IDM_ACTION_DIM = 3 # delta_x, delta_y, delta_yaw 
+_IDM_ACTION_DIM = 3 # forward, right, yaw_right (KITTISequence.get_ego_motion)
 
 
 class _SDPASelfAttention(nn.Module):
