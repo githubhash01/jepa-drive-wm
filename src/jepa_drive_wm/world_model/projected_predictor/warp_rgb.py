@@ -386,8 +386,8 @@ if __name__ == "__main__":
     N_FUTURE = 4
     FRAME_STRIDE = 5
 
-    sequence = KITTISequence(sequence_nr=16)
-    frame_ids = [200 + FRAME_STRIDE * i for i in range(N_OBSERVED + N_FUTURE)]
+    sequence = KITTISequence(sequence_nr=1)
+    frame_ids = [1 + FRAME_STRIDE * i for i in range(N_OBSERVED + N_FUTURE)]
     observed_ids = frame_ids[:N_OBSERVED]
     future_ids = frame_ids[N_OBSERVED:]
     source_id = observed_ids[-1]
@@ -532,3 +532,161 @@ if __name__ == "__main__":
     fig.suptitle("Future ground truth vs deterministic forward projection", fontsize=14)
     plt.tight_layout()
     plt.show()
+
+    # -------------------------------------------------------------
+    # 4. Encode the GT future frames and the warped frames with the
+    #    V-JEPA 2.1 ViT-B encoder in image mode, and compare them in
+    #    the global PCA RGB space.
+    # -------------------------------------------------------------
+
+    import numpy as np
+
+    from jepa_drive_wm.utils.vjepa_wrapper import VJEPA21Size, VJEPA21Wrapper
+    from jepa_drive_wm.viz.visualiser import FVVisualizer
+
+    wrapper = VJEPA21Wrapper(
+        size=VJEPA21Size.BASE,
+        image_height=H,
+        image_width=W,
+    )
+
+    # prepare_frame expects uint8 arrays (it round-trips through PIL).
+    def _to_uint8(rgb01: np.ndarray) -> np.ndarray:
+        return (np.clip(rgb01, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    gt_frames = [_to_uint8(sequence.get_image(fid)) for fid in future_ids]
+    warped_frames = [
+        _to_uint8(output.rgb_patch_masked.detach().cpu().numpy())
+        for output in warped_outputs
+    ]
+
+    gt_feats = wrapper.encode_images(gt_frames)          # (N_FUTURE, Hp*Wp, 768)
+    warped_feats = wrapper.encode_images(warped_frames)  # (N_FUTURE, Hp*Wp, 768)
+
+    # Latent infill: replace each patch that was masked in the warp with the
+    # corresponding patch latent of the source frame (last observed timestep).
+    source_feats = wrapper.encode_images(
+        [_to_uint8(source_rgb.detach().cpu().numpy())]
+    )[0]                                                 # (Hp*Wp, 768)
+    infilled_feats = warped_feats.clone()
+    for col, output in enumerate(warped_outputs):
+        invalid = ~output.patch_valid.reshape(-1).cpu()
+        infilled_feats[col][invalid] = source_feats[invalid]
+
+    # Defaults to OUTPUTS_DIR / "vjepa21_global_train_pca.npz".
+    visualiser = FVVisualizer()
+    grid_hw = (H // wrapper.patch_size, W // wrapper.patch_size)
+
+    fig, axes = plt.subplots(2, N_FUTURE, figsize=(4.5 * N_FUTURE, 6), squeeze=False)
+
+    for col, future_id in enumerate(future_ids):
+        gt_pca = visualiser.vjepa_embedding_pca(gt_feats[col], grid_hw=grid_hw)
+        warped_pca = visualiser.vjepa_embedding_pca(infilled_feats[col], grid_hw=grid_hw)
+
+        axes[0, col].imshow(gt_pca, interpolation="nearest")
+        axes[0, col].set_title(f"GT frame {future_id} (PCA)")
+        axes[0, col].axis("off")
+
+        axes[1, col].imshow(warped_pca, interpolation="nearest")
+        axes[1, col].set_title(f"Warped from {source_id} + t0 infill (PCA)")
+        axes[1, col].axis("off")
+
+    fig.suptitle(
+        "V-JEPA 2.1 ViT-B image-mode embeddings in global PCA space",
+        fontsize=14,
+    )
+    plt.tight_layout()
+    plt.show()
+
+    # -------------------------------------------------------------
+    # 5. Decode depth and semantics from the same embeddings with the
+    #    frozen dense decoders: GT-frame latent vs warped-frame latent.
+    # -------------------------------------------------------------
+
+    from jepa_drive_wm.dense_decoder.model_depth import DepthDecoder
+    from jepa_drive_wm.dense_decoder.model_semantics import SemanticDecoder
+    from jepa_drive_wm.dense_decoder.train_depth import (
+        CHECKPOINT_PATH as DEPTH_CHECKPOINT,
+        MAX_DEPTH,
+        MIN_DEPTH,
+        predict as predict_depth,
+    )
+    from jepa_drive_wm.dense_decoder.train_semantics import (
+        CHECKPOINT_PATH as SEMANTICS_CHECKPOINT,
+        predict as predict_semantics,
+    )
+    from jepa_drive_wm.viz.visualiser import class_colors
+
+    def _load_decoder(cls, path):
+        checkpoint = torch.load(path, map_location=device)
+        decoder = cls().to(device)
+        decoder.load_state_dict(checkpoint["model_state_dict"])
+        decoder.eval()
+        return decoder
+
+    depth_decoder = _load_decoder(DepthDecoder, DEPTH_CHECKPOINT)
+    semantic_decoder = _load_decoder(SemanticDecoder, SEMANTICS_CHECKPOINT)
+
+    grid_h, grid_w = grid_hw
+
+    def _to_grid(flat_tokens: torch.Tensor) -> torch.Tensor:
+        """(Hp*Wp, 768) flat tokens -> [1, 768, Hp, Wp] decoder input."""
+        return flat_tokens.view(grid_h, grid_w, -1).permute(2, 0, 1)[None].to(device)
+
+    depth_gt_maps, depth_from_gt, depth_from_warp = [], [], []
+    sem_gt_maps, sem_from_gt, sem_from_warp = [], [], []
+
+    with torch.no_grad():
+        for col, future_id in enumerate(future_ids):
+            gt_depth = sequence.get_depth(future_id)
+            gt_semantics = sequence.get_semantics(future_id)
+            gt_grid = _to_grid(gt_feats[col])
+            warp_grid = _to_grid(infilled_feats[col])
+
+            depth_gt_maps.append(gt_depth)
+            depth_from_gt.append(
+                predict_depth(depth_decoder, gt_grid, gt_depth.shape).cpu()
+            )
+            depth_from_warp.append(
+                predict_depth(depth_decoder, warp_grid, gt_depth.shape).cpu()
+            )
+
+            sem_gt_maps.append(class_colors(gt_semantics))
+            sem_from_gt.append(class_colors(
+                predict_semantics(semantic_decoder, gt_grid, gt_semantics.shape)
+                .argmax(dim=1)[0].cpu().numpy()
+            ))
+            sem_from_warp.append(class_colors(
+                predict_semantics(semantic_decoder, warp_grid, gt_semantics.shape)
+                .argmax(dim=1)[0].cpu().numpy()
+            ))
+
+    depth_kwargs = dict(cmap="plasma", vmin=MIN_DEPTH, vmax=MAX_DEPTH)
+    depth_rows = [
+        ("GT depth\n(pseudolabel)", depth_gt_maps, depth_kwargs),
+        ("depth from\nGT frame", depth_from_gt, depth_kwargs),
+        ("depth from\nwarp + t0 infill", depth_from_warp, depth_kwargs),
+    ]
+    sem_rows = [
+        ("OneFormer\nsemantics", sem_gt_maps, {}),
+        ("semantics from\nGT frame", sem_from_gt, {}),
+        ("semantics from\nwarp + t0 infill", sem_from_warp, {}),
+    ]
+
+    for rows, name in [(depth_rows, "Depth"), (sem_rows, "Semantics")]:
+        fig, axes = plt.subplots(
+            len(rows), N_FUTURE, figsize=(4.5 * N_FUTURE, 2.2 * len(rows)), squeeze=False
+        )
+        for row, (label, images, kwargs) in enumerate(rows):
+            for col, future_id in enumerate(future_ids):
+                ax = axes[row, col]
+                ax.imshow(images[col], **kwargs)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                if row == 0:
+                    ax.set_title(f"future {future_id}")
+                if col == 0:
+                    ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=9)
+        fig.suptitle(f"{name}: GT frame vs warp + t0 infill (decoded from V-JEPA latents)")
+        plt.tight_layout()
+        plt.show()
