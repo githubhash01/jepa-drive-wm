@@ -6,12 +6,17 @@ semantic segmentation) trained on pseudolabeled KITTI odometry.
 ## Layout
 
 ```
-src/jepa_drive_wm/     the package (data, world_model, dense_decoder, utils, viz, ...)
+src/jepa_drive_wm/     the package (data, encoders, models, train, evals, viz, ...)
 vjepa2/                vendored V-JEPA 2 checkout (code tracked; checkpoints git-ignored)
 dataset/KITTI/         KITTI odometry root (git-ignored; symlink or real data)
 outputs/               trained checkpoints, PCA files (git-ignored)
-scripts/migrate/       machine-migration helpers (pack_usb / unpack_uni / build_latents_all)
 ```
+
+Inside the package: `data/` holds the KITTI interface, splits, and
+`data/dataset_builders/` (the pseudolabel/embedding generators that annotated
+the dataset); `encoders/` the frozen V-JEPA / DINOv3 wrappers; `models/` the
+decoders and predictors; `train/` the trainers; `evals/` the test-set
+evaluators.
 
 All paths are centralised in `src/jepa_drive_wm/paths.py` and overridable via
 `JEPA_KITTI_ROOT`, `JEPA_VJEPA_REPO`, `JEPA_VJEPA_CKPT_DIR`, `JEPA_OUTPUTS_DIR`.
@@ -39,39 +44,42 @@ Defaults are relative to the repo root, so a clone with data under
    # headless alternative: export WANDB_API_KEY=<key>   (add to your shell rc)
    # no network? export WANDB_MODE=offline, then `wandb sync wandb/latest-run` later
    ```
-4. **Data** — from the transfer USB stick:
+4. **Data** — lay KITTI (images, depth + semantic pseudolabels, poses) into
+   `dataset/KITTI/` and the ViT-B checkpoint into
+   `vjepa2/model_checkpoints/vjepa21/`. The pseudolabels are already generated;
+   the generators live in `src/jepa_drive_wm/data/dataset_builders/` if they
+   ever need to be re-run.
+5. **Regenerate V-JEPA latents** (117G, not transferred — rebuilt on the GPU):
    ```bash
-   ./scripts/migrate/unpack_uni.sh /media/<user>/<STICK>/jepa-drive-wm-transfer "$PWD"
-   ```
-   This lays KITTI (images, depth + semantic pseudolabels, poses) into
-   `dataset/KITTI/` and the ViT-B checkpoint into `vjepa2/model_checkpoints/vjepa21/`.
-5. **Regenerate V-JEPA latents** (not transferred — 117G, rebuilt on the GPU):
-   ```bash
-   ./scripts/migrate/build_latents_all.sh 4      # smoke test: smallest sequence (271 frames)
-   ./scripts/migrate/build_latents_all.sh        # all sequences 0..21 (~43.5k frames)
+   PYTHONPATH=src python -m jepa_drive_wm.data.dataset_builders.vjepa_embeddings_builder --sequences 4     # smoke test: smallest sequence
+   PYTHONPATH=src python -m jepa_drive_wm.data.dataset_builders.vjepa_embeddings_builder --sequences 0-21  # all (~43.5k frames)
    ```
 6. **Smoke tests**
    ```bash
-   PYTHONPATH=src python -m jepa_drive_wm.data.kitti                          # calib sanity
-   PYTHONPATH=src python -m jepa_drive_wm.dense_decoder.data_interface_dense  # dense batches
-   PYTHONPATH=src python -m jepa_drive_wm.world_model.data_interface_wm       # rollout batches
-   PYTHONPATH=src python -m jepa_drive_wm.world_model.train_wm --smoke-test   # full loop
+   PYTHONPATH=src python -m jepa_drive_wm.data.kitti                    # calib sanity
+   PYTHONPATH=src python -m jepa_drive_wm.data.data_interface_dense     # dense batches
+   PYTHONPATH=src python -m jepa_drive_wm.data.data_interface_rollout   # rollout batches
+   PYTHONPATH=src python -m jepa_drive_wm.train.train_wm --smoke-test   # full loop
    ```
 
 ## Training
 
 ```bash
-PYTHONPATH=src python -m jepa_drive_wm.world_model.train_wm
-PYTHONPATH=src python -m jepa_drive_wm.dense_decoder.train_depth
-PYTHONPATH=src python -m jepa_drive_wm.dense_decoder.train_semantics
+PYTHONPATH=src python -m jepa_drive_wm.train.train_wm
+PYTHONPATH=src python -m jepa_drive_wm.train.train_depth
+PYTHONPATH=src python -m jepa_drive_wm.train.train_semantics
 ```
 
-Checkpoints land in `outputs/`; runs log to wandb project `jepa-drive-wm`.
+All training and evaluation uses the sequence split defined in
+`src/jepa_drive_wm/data/splits.py` (`SPLIT_V1`): trainers only ever evaluate on
+train+validation, and the scripts in `src/jepa_drive_wm/evals/` report test-set
+metrics on the saved checkpoints. Checkpoints land in `outputs/`; runs log to
+wandb project `jepa-drive-wm`.
 
 ## Notes
 
 - Depth pseudolabels came from FoundationStereo, semantics from OneFormer
-  (`utils/depth_builder.py`, `utils/oneformer_kitti.py`). Both are already built
-  and travel with the dataset; the generators (and FoundationStereo itself) are
-  not needed on the training machine.
+  (`data/dataset_builders/depth_builder.py`, `data/dataset_builders/oneformer_kitti.py`).
+  Both are already built and travel with the dataset; the generators (and
+  FoundationStereo itself) are not needed on the training machine.
 - Only the ViT-B distilled checkpoint (`vjepa2_1_vitb_dist_vitG_384.pt`) is used.
