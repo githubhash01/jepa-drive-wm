@@ -16,20 +16,20 @@ Why this exists:
     This script fits PCA once over sampled training patches, saves the basis,
     and applies the same basis everywhere.
 
-Typical use from your scripts/ directory:
+Typical use (from the repo root, PYTHONPATH=src):
 
-    python3 global_pca_kitti.py --fit --visualize
+    python -m jepa_drive_wm.data.global_pca --fit --visualize
 
 Useful variants:
 
     # fit from more patches, but cap frames per sequence
-    python3 global_pca_kitti.py --fit --patches-per-frame 256 --max-frames-per-seq 1000
+    python -m jepa_drive_wm.data.global_pca --fit --patches-per-frame 256 --max-frames-per-seq 1000
 
     # only visualize using an existing saved PCA
-    python3 global_pca_kitti.py --visualize --viz-sequences 0 1 2 3 4 5 6 7 9 10 --viz-frame 0
+    python -m jepa_drive_wm.data.global_pca --visualize --viz-sequences 0 1 2 3 4 5 6 7 9 10 --viz-frame 0
 
     # make smoother image-sized overlays as well as honest patch-grid images
-    python3 global_pca_kitti.py --visualize --upsample bilinear
+    python -m jepa_drive_wm.data.global_pca --visualize --upsample bilinear
 """
 
 import argparse
@@ -43,11 +43,15 @@ from tqdm import tqdm
 from sklearn.decomposition import IncrementalPCA
 from PIL import Image
 import matplotlib.pyplot as plt
+from jepa_drive_wm.data.splits import SPLIT_V1
 from jepa_drive_wm.paths import OUTPUTS_DIR
 OUT_DIR = str(OUTPUTS_DIR)
 
 
-DEFAULT_FIT_SEQUENCES = [0, 1, 2, 4, 5, 6]          # train split: avoid leaking val/test into PCA
+# The PCA basis is a training-set statistic: fit only on the train split so no
+# val/test data leaks into it. Visualising with the frozen basis is harmless on
+# any sequence.
+DEFAULT_FIT_SEQUENCES = list(SPLIT_V1.train_sequences)
 DEFAULT_VIZ_SEQUENCES = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]
 
 @dataclass 

@@ -8,11 +8,11 @@ import pathlib
 
 from jepa_drive_wm.paths import SEQUENCES_DIR, GT_POSES_DIR
 
-# OneFormer Cityscapes semantic label maps now live inside each sequence folder
-# (see scripts/reorg_semantics.py), alongside image_2/depth/vjepa_vitb.
+# OneFormer Cityscapes semantic label maps live inside each sequence folder,
+# alongside image_2/depth/vjepa_vitb (built by data/dataset_builders/oneformer_kitti.py).
 SEMANTICS_DIRNAME = "semantic_oneformer"
 
-# V-JEPA 2.1 ViT-B cache written by utils/vjepa_embeddings_builder.py, one .npy per
+# V-JEPA 2.1 ViT-B cache written by data/dataset_builders/vjepa_embeddings_builder.py, one .npy per
 # frame inside each sequence folder. The grid/dim below are only fallbacks for when
 # the cache has no _metadata.json; they match a 384x1248 input at patch size 16.
 VJEPA_BASE_DIRNAME = "vjepa_vitb"
@@ -192,15 +192,14 @@ class KITTISequence:
     def get_semantics(self, i: int) -> np.ndarray:
         """
         Load the OneFormer Cityscapes semantic label map at frame i as a (H, W)
-        int64 array of class ids (0..18), produced by utils/oneformer_kitti.py
+        int64 array of class ids (0..18), produced by data/dataset_builders/oneformer_kitti.py
         and saved under <sequence>/semantic_oneformer/<frame>.png.
         """
         path = self.sequence_folder / SEMANTICS_DIRNAME / f"{i:06d}.png"
         if not path.exists():
             raise FileNotFoundError(
                 f"No saved semantics at {path}. Run "
-                f"`python -m jepa_drive_wm.utils.oneformer_kitti build --seq {self.sequence_nr}`, "
-                f"then `python scripts/reorg_semantics.py --apply` to consolidate."
+                f"`python -m jepa_drive_wm.data.dataset_builders.oneformer_kitti build --seq {self.sequence_nr}` first."
             )
         return np.asarray(Image.open(path)).astype(np.int64)
 
@@ -210,7 +209,7 @@ class KITTISequence:
         Load the cached V-JEPA 2.1 ViT-B token embedding for frame i.
 
         Frames are encoded independently in image mode (T=1) by
-        utils/vjepa_embeddings_builder.py, and stored fp16 as
+        data/dataset_builders/vjepa_embeddings_builder.py, and stored fp16 as
         SEQUENCES_DIR/<seq>/vjepa_vitb/<frame>.npy.
 
         as_grid=False (default) -> (grid_h * grid_w, embed_dim), the raw token
@@ -222,7 +221,7 @@ class KITTISequence:
         if not pathlib.Path(path).exists():
             raise FileNotFoundError(
                 f"No cached V-JEPA embedding at {path}. Run "
-                f"`python -m jepa_drive_wm.utils.vjepa_embeddings_builder "
+                f"`python -m jepa_drive_wm.data.dataset_builders.vjepa_embeddings_builder "
                 f"--sequence {self.sequence_nr}` first."
             )
 
