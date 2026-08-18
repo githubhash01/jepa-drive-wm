@@ -23,7 +23,7 @@ from jepa_drive_wm.data.data_interface_dense import KITTIDenseLoaders
 from jepa_drive_wm.data.splits import SPLIT_V1
 from jepa_drive_wm.models.dense_decoders.semantic_decoder import SemanticDecoder
 from jepa_drive_wm.paths import OUTPUTS_DIR
-from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite
+from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite, init_run
 
 # ----------------------------------------------------------------------------- config
 
@@ -45,11 +45,9 @@ WEIGHT_DECAY = 0.01
 # All of the above are defaults; every one is overridable on the command line
 # (see main's argparse) so budgets can be tuned per-machine without editing files.
 
-# Sequence assignment lives in data/splits.py. These names exist so the wandb
-# run config records the split, and evals/semantics_evaluator.py imports
+# Sequence assignment lives in data/splits.py; init_run records the full split in
+# the wandb config. This name exists because evals/semantics_evaluator.py imports
 # TEST_SEQUENCES from here.
-TRAIN_SEQUENCES = list(SPLIT_V1.train_sequences)
-VALIDATION_SEQUENCES = list(SPLIT_V1.validation_sequences)
 TEST_SEQUENCES = list(SPLIT_V1.test_sequences)
 
 CHECKPOINT_PATH = OUTPUTS_DIR / "checkpoints_semantics" / "semantic_decoder_best.pt"
@@ -133,29 +131,24 @@ def main() -> None:
     print(loaders)
 
     total_opt_steps = args.max_iters // args.grad_accum
-    wandb.init(
-        project="jepa-drive-wm",
-        job_type="semantic_decoder",
-        config={
-            "max_iters": args.max_iters,
-            "grad_accum": args.grad_accum,
-            "effective_batch": args.grad_accum,
-            "num_workers": args.num_workers,
-            "amp_dtype": "bfloat16",
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "num_classes": NUM_CLASSES,
-            "ignore_index": IGNORE_INDEX,
-            "train_sequences": TRAIN_SEQUENCES,
-            "validation_sequences": VALIDATION_SEQUENCES,
-            "test_sequences": TEST_SEQUENCES,
-        },
-    )
-    wandb.define_metric("iter")
-    wandb.define_metric("train/*", step_metric="iter")
-    wandb.define_metric("val/*", step_metric="iter")
 
     model = SemanticDecoder().to(DEVICE)
+
+    init_run(
+        job_type="semantic_decoder",
+        name=f"semantics-lr{args.lr:g}-{args.max_iters // 1000}k",
+        tags=["semantics", "dense-decoder", "dpt"],
+        config={
+            **vars(args),
+            "checkpoint": str(args.checkpoint),
+            "effective_batch": args.grad_accum,  # loader batch is fixed at 1
+            "parameter_count": sum(p.numel() for p in model.parameters()),
+            "num_classes": NUM_CLASSES,
+            "ignore_index": IGNORE_INDEX,
+        },
+        split=SPLIT_V1,
+    )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_warmup_cosine(optimizer, total_opt_steps, int(args.warmup_frac * total_opt_steps))
 
