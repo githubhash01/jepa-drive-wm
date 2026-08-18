@@ -87,19 +87,29 @@ class ActionEmbedder(nn.Module):
 # 3D axial RoPE
 # ---------------------------------------------------------------------------
 
-def rotate(
-    x: Float[Tensor, "batch heads seq rot_dim"],
-    pos: Float[Tensor, "seq"],
-) -> Float[Tensor, "batch heads seq rot_dim"]:
-    """Rotate the last dim of x by positions `pos` (standard RoPE)."""
+def rotate(x, pos):
     D = x.shape[-1]
-    omega = torch.arange(D // 2, dtype=x.dtype, device=x.device) / (D / 2.0)
-    omega = 1.0 / 10000**omega                                   # (D/2,)
-    freq: Float[Tensor, "seq halfdim"] = torch.einsum("n, f -> n f", pos, omega)
-    sin = freq.sin().repeat_interleave(2, dim=-1)                # (seq, D)
-    cos = freq.cos().repeat_interleave(2, dim=-1)
+
+    omega = torch.arange(
+        D // 2,
+        dtype=torch.float32,
+        device=x.device,
+    ) / (D / 2.0)
+
+    omega = 1.0 / 10000**omega
+
+    freq = torch.einsum(
+        "n,f->nf",
+        pos.float(),
+        omega,
+    )
+
+    sin = freq.sin().repeat_interleave(2, dim=-1).to(x.dtype)
+    cos = freq.cos().repeat_interleave(2, dim=-1).to(x.dtype)
+
     x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
     x_rot = torch.stack((-x2, x1), dim=-1).flatten(-2)
+
     return x * cos + x_rot * sin
 
 
