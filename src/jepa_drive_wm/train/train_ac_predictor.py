@@ -173,6 +173,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--context-length", type=int, default=4)
     parser.add_argument("--future-length", type=int, default=2)
+    # KITTI runs at 10 Hz, so one prediction step spans frame_stride * 0.1 s:
+    # stride 5 -> 0.5 s, stride 2 -> 0.2 s. This is the horizon of the model.
     parser.add_argument("--frame-stride", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=8)  # hide shared-FS read latency
     parser.add_argument("--log-every", type=int, default=100)
@@ -181,7 +183,9 @@ def main() -> None:
         action="store_true",
         help="Run a few batches through train+val and exit, to prove the loop.",
     )
-    parser.add_argument("--checkpoint", type=Path, default=OUTPUTS_DIR / "checkpoints_wm" / "world_model.pt")
+    # Defaults to a step-tagged path so runs at different horizons (0.5s vs 0.2s)
+    # never overwrite each other's weights.
+    parser.add_argument("--checkpoint", type=Path, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -200,16 +204,26 @@ def main() -> None:
     parameter_count = sum(p.numel() for p in model.parameters())
     print(f"parameters: {parameter_count / 1e6:.1f}M")
 
+    # The prediction horizon is the headline difference between runs, so it goes
+    # in the run name, the tags and the checkpoint filename. `loaders.step_seconds`
+    # is the single source of truth -- never recompute it from frame_stride.
+    step_tag = f"dt{loaders.step_seconds:g}s"
+    if args.checkpoint is None:
+        args.checkpoint = (
+            OUTPUTS_DIR / "checkpoints_wm" / f"world_model_{step_tag}.pt"
+        )
+    print(f"checkpoint: {args.checkpoint}")
+
     # The window geometry is what varies between predictor runs, so the run name
     # carries it. `disabled` turns every wandb.log below into a no-op during
     # smoke tests.
     init_run(
         job_type="ac_predictor",
         name=(
-            f"ac-c{args.context_length}f{args.future_length}s{args.frame_stride}"
-            f"-lr{args.lr:g}-{args.max_iters // 1000}k"
+            f"ac-{step_tag}-c{args.context_length}f{args.future_length}"
+            f"s{args.frame_stride}-lr{args.lr:g}-{args.max_iters // 1000}k"
         ),
-        tags=["ac-predictor", "world-model", "rollout"],
+        tags=["ac-predictor", "world-model", "rollout", step_tag],
         config={
             **vars(args),
             "checkpoint": str(args.checkpoint),
