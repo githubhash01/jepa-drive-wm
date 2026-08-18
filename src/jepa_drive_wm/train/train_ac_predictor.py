@@ -27,7 +27,7 @@ from jaxtyping import Float
 from torch import Tensor
 
 from jepa_drive_wm.paths import OUTPUTS_DIR
-from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite
+from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite, init_run
 from jepa_drive_wm.data.data_interface_rollout import KITTIRolloutLoaders
 from jepa_drive_wm.data.splits import SPLIT_V1
 from jepa_drive_wm.models.predictors.ac_style.ac_predictor import VJEPA21WorldModel
@@ -162,9 +162,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train the VJEPA2.1 world model")
     # Iteration budget (micro-steps = batches), not epochs. The world model has
     # no prior run to calibrate against, so this is a sensible first budget:
-    # 40k batches of 2 over ~18.9k windows is ~4 effective passes. Watch val/ar
-    # and extend with --max-iters if it is still improving.
-    parser.add_argument("--max-iters", type=int, default=40_000)
+    # 80k batches of 2 over the ~35.3k SPLIT_V1 train windows is ~4.5 effective
+    # passes. Watch val/ar and extend with --max-iters if it is still improving.
+    parser.add_argument("--max-iters", type=int, default=80_000)
     parser.add_argument("--grad-accum", type=int, default=4)  # eff. batch = grad_accum * batch_size
     parser.add_argument("--val-every", type=int, default=5_000)
     parser.add_argument("--warmup-frac", type=float, default=0.03)
@@ -196,28 +196,31 @@ def main() -> None:
     )
     print(loaders)
 
-    # `disabled` turns every wandb.log below into a no-op during smoke tests.
-    wandb.init(
-        project="jepa-drive-wm",
-        job_type="world_model",
+    model = VJEPA21WorldModel().to(device)
+    parameter_count = sum(p.numel() for p in model.parameters())
+    print(f"parameters: {parameter_count / 1e6:.1f}M")
+
+    # The window geometry is what varies between predictor runs, so the run name
+    # carries it. `disabled` turns every wandb.log below into a no-op during
+    # smoke tests.
+    init_run(
+        job_type="ac_predictor",
+        name=(
+            f"ac-c{args.context_length}f{args.future_length}s{args.frame_stride}"
+            f"-lr{args.lr:g}-{args.max_iters // 1000}k"
+        ),
+        tags=["ac-predictor", "world-model", "rollout"],
         config={
             **vars(args),
             "checkpoint": str(args.checkpoint),
+            "effective_batch": args.grad_accum * args.batch_size,
+            "parameter_count": parameter_count,
             "max_speed_mps": MAX_SPEED_MPS,
             "step_seconds": loaders.step_seconds,
-            "split": SPLIT_V1.name,
-            "train_sequences": list(SPLIT_V1.train_sequences),
-            "validation_sequences": list(SPLIT_V1.validation_sequences),
-            "test_sequences": list(SPLIT_V1.test_sequences),
         },
+        split=SPLIT_V1,
         mode="disabled" if args.smoke_test else "online",
     )
-    wandb.define_metric("iter")
-    wandb.define_metric("train/*", step_metric="iter")
-    wandb.define_metric("val/*", step_metric="iter")
-
-    model = VJEPA21WorldModel().to(device)
-    print(f"parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
