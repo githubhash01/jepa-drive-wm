@@ -36,8 +36,8 @@ from jepa_drive_wm.training_utils import autocast
 from jepa_drive_wm.viz.visualiser import class_colors
 from jepa_drive_wm.data.data_interface_rollout import KITTIRolloutDataset
 from jepa_drive_wm.data.splits import SPLIT_V1
-from jepa_drive_wm.models.predictors.simple_predictor.simple_predictor import VJEPA21WorldModel
-from jepa_drive_wm.train.train_wm import MAX_SPEED_MPS, action_scale, latent_loss, to_grid
+from jepa_drive_wm.models.predictors.ac_style.ac_predictor import VJEPA21WorldModel
+from jepa_drive_wm.train.train_ac_predictor import MAX_SPEED_MPS, action_scale, latent_loss, to_grid
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

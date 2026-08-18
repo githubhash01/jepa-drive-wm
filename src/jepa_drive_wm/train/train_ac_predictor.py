@@ -7,11 +7,12 @@ Big idea:
 - Teacher forcing loss: predict each future frame from a ground-truth history.
 - Rollout loss: predict the future autoregressively, feeding predictions back
   as context, with gradients flowing through the fed-back predictions.
-- Total loss = teacher forcing + rollout (equal weight, as in VJEPA2-AC).
+- Total loss = teacher forcing + rollout.
 
-Following VJEPA2-AC, the loss is L1 between layer-normalised latents. The
-first future step has no history to differ on, so it is shared between the
-two losses (also as in VJEPA2-AC, where z_ar starts from z_tf's first frame).
+Unlike VJEPA2-AC's normalize_reps=True training configuration, this model
+operates directly in the frozen V-JEPA 2.1 encoder representation space Z.
+Both teacher-forcing and rollout losses are L1 losses between predicted and
+ground-truth V-JEPA latents, with no additional representation normalisation.
 """
 
 import argparse
@@ -29,7 +30,7 @@ from jepa_drive_wm.paths import OUTPUTS_DIR
 from jepa_drive_wm.training_utils import autocast, build_warmup_cosine, infinite
 from jepa_drive_wm.data.data_interface_rollout import KITTIRolloutLoaders
 from jepa_drive_wm.data.splits import SPLIT_V1
-from jepa_drive_wm.models.predictors.simple_predictor.simple_predictor import VJEPA21WorldModel
+from jepa_drive_wm.models.predictors.ac_style.ac_predictor import VJEPA21WorldModel
 
 # Speed ceiling used to normalise per-step translation. Generous for road
 # vehicles (~90 mph); KITTI's fastest highway stretches reach ~34 m/s.
@@ -67,14 +68,11 @@ def latent_loss(
     pred: Float[Tensor, "batch steps height width latent"],
     target: Float[Tensor, "batch steps height width latent"],
 ) -> Float[Tensor, ""]:
-    """L1 between layer-normalised latents (VJEPA2-AC's normalize_reps).
+    """L1 directly in the V-JEPA 2.1 latent space.
 
-    Cast to fp32 first: predictions arrive in bf16 under autocast, and the
-    layer-norm + L1 are cheap, so we do them in full precision for a stable loss.
+    Predictions may arrive in bf16 under autocast; compute the loss in fp32.
     """
-    pred = F.layer_norm(pred.float(), (pred.size(-1),))
-    target = F.layer_norm(target.float(), (target.size(-1),))
-    return F.l1_loss(pred, target)
+    return F.l1_loss(pred.float(), target.float())
 
 
 def forward_predictions(
