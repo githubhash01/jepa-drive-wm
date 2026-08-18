@@ -386,7 +386,7 @@ if __name__ == "__main__":
     N_FUTURE = 4
     FRAME_STRIDE = 5
 
-    sequence = KITTISequence(sequence_nr=1)
+    sequence = KITTISequence(sequence_nr=7)
     frame_ids = [1 + FRAME_STRIDE * i for i in range(N_OBSERVED + N_FUTURE)]
     observed_ids = frame_ids[:N_OBSERVED]
     future_ids = frame_ids[N_OBSERVED:]
