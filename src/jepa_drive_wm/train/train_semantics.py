@@ -46,9 +46,8 @@ WEIGHT_DECAY = 0.01
 # (see main's argparse) so budgets can be tuned per-machine without editing files.
 
 # Sequence assignment lives in data/splits.py; init_run records the full split in
-# the wandb config. This name exists because evals/semantics_evaluator.py imports
-# TEST_SEQUENCES from here.
-TEST_SEQUENCES = list(SPLIT_V1.test_sequences)
+# the wandb config. Test metrics come from evals/semantics_evaluator.py, which
+# reads the split itself.
 
 CHECKPOINT_PATH = OUTPUTS_DIR / "checkpoints_semantics" / "semantic_decoder_best.pt"
 
