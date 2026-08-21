@@ -20,6 +20,10 @@ The default image size is 384 x 1248, matching the current V-JEPA / KITTI
 pipeline. RGB and depth are resized in the dataset and the camera intrinsics are
 scaled consistently.
 
+Windows whose source frame ``I_t`` has no usable depth pseudolabel (FoundationStereo
+left gaps: seq 08 is missing 71 depth PNGs, seq 00 has 12 zero-byte ones) are
+dropped when the index is built, so a shuffled training run cannot crash on them.
+
 Current ``ProjectedPredictor.forward`` is deliberately per-sample because the
 geometry-derived token masks have variable lengths. ``projected_predictor_inputs``
 therefore converts a batch-size-one DataLoader batch directly into keyword
@@ -27,6 +31,8 @@ arguments for the model.
 """
 
 from __future__ import annotations
+
+import pathlib
 
 import numpy as np
 import torch
@@ -117,10 +123,28 @@ class KITTIProjectedPredictorDataset(Dataset):
         total_frames = self.context_length + self.future_length
         window_span = (total_frames - 1) * self.frame_stride + 1
 
+        # Skip windows whose source frame I_t (the only frame whose depth is
+        # loaded, see __getitem__) has a missing or corrupt depth pseudolabel.
+        # FoundationStereo leaves gaps (seq 08 has 71 frames with no depth) and a
+        # handful of 0-byte PNGs (seq 00 has 12); indexing them blindly crashes a
+        # shuffled training run at a random iteration. A valid depth PNG is tens
+        # of KB, so "exists and size > 0" is a safe, cheap filter (same test as
+        # data_interface_dense.py) -- no need to open every file.
         for sequence_nr, sequence in self.sequences.items():
-            number_windows = len(sequence) - window_span + 1
-            for start_index in range(max(0, number_windows)):
-                self.index.append((sequence_nr, start_index))
+            number_windows = max(0, len(sequence) - window_span + 1)
+            kept = 0
+            for start_index in range(number_windows):
+                source_frame = start_index + (self.context_length - 1) * self.frame_stride
+                depth_path = pathlib.Path(sequence.depths[source_frame])
+                if depth_path.exists() and depth_path.stat().st_size > 0:
+                    self.index.append((sequence_nr, start_index))
+                    kept += 1
+            skipped = number_windows - kept
+            note = f"  ({skipped} skipped: missing/empty depth for I_t)" if skipped else ""
+            print(
+                f"[{type(self).__name__}] seq {sequence_nr:02d}: "
+                f"{kept}/{number_windows} windows usable{note}"
+            )
 
     def __len__(self) -> int:
         return len(self.index)

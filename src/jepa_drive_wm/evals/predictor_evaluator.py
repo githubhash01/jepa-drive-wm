@@ -475,8 +475,8 @@ def plot_latent_curves(results: dict[str, dict], path: Path) -> None:
                             label=f"{tag} - {VARIANTS[variant]}", **style)
     ax_rel.axhline(1.0, color=MUTED, linewidth=1.0, linestyle=":")
     ax_rel.text(ax_rel.get_xlim()[1], 1.0, " copy baseline", va="center", ha="right", fontsize=8, color=MUTED)
-    ax_rel.text(0.02, 0.03, "rollouts / copy-last;  one-step / copy-previous", transform=ax_rel.transAxes,
-                fontsize=8, color=MUTED, ha="left", va="bottom")
+    ax_rel.text(0.02, 0.95, "rollouts / copy-last;  one-step / copy-previous", transform=ax_rel.transAxes,
+                fontsize=8, color=MUTED, ha="left", va="top")
     style_axes(ax_abs, title="Latent L1 vs horizon (test set)", xlabel="horizon (s)",
                ylabel="mean |pred - true| in V-JEPA space")
     style_axes(ax_rel, title="Relative to the matching copy baseline", xlabel="horizon (s)",
