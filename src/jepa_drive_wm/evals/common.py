@@ -34,6 +34,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEPTH_CHECKPOINT = OUTPUTS_DIR / "checkpoints_depth" / "depth_decoder_best.pt"
 SEMANTICS_CHECKPOINT = OUTPUTS_DIR / "checkpoints_semantics" / "semantic_decoder_best.pt"
 WM_CHECKPOINT_DIR = OUTPUTS_DIR / "checkpoints_wm"
+PROJECTED_CHECKPOINT_DIR = OUTPUTS_DIR / "checkpoints_projected_predictor"
 
 
 # ----------------------------------------------------------------------------- checkpoints
@@ -82,6 +83,9 @@ def describe_checkpoint(path: Path, checkpoint: dict) -> str:
         parts.append(f"val ar {checkpoint['val_ar']:.4f}")
     if "step_seconds" in checkpoint:
         parts.append(f"step {checkpoint['step_seconds']:g}s")
+    val = checkpoint.get("val")  # projected predictor: {total, context, masked, h1..h4}
+    if isinstance(val, dict) and "total" in val:
+        parts.append(f"val total {val['total']:.4f}")
     validation = checkpoint.get("validation_metrics", {})
     for key in ("total", "loss", "absrel", "accuracy"):
         if key in validation:
