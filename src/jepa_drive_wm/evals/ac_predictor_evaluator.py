@@ -1,62 +1,74 @@
 """
-Evaluate the trained ac-style world models on the held-out KITTI test sequences
-(SPLIT_V1.test_sequences, see data/splits.py).
+Focused evaluation of the action-conditioned V-JEPA 2.1 latent predictors.
 
-    PYTHONPATH=src python -m jepa_drive_wm.evals.predictor_evaluator \
-        [--checkpoints outputs/checkpoints_wm/world_model_dt0.2s.pt ...] [--rollout-steps 4]
+The evaluator is deliberately shaped around the final thesis tables. For each
+checkpoint it reports three things:
 
-By default every `world_model_dt*.pt` in OUTPUTS_DIR/checkpoints_wm is
-evaluated. Each checkpoint records its own step duration (`step_seconds`), so
-the frame stride of the test windows is derived per model (0.2 s -> stride 2,
-0.5 s -> stride 5). Every model is rolled out for --rollout-steps steps
-(default 4: 0.8 s for the 0.2 s model, 2.0 s for the 0.5 s model); pass
---horizon-seconds instead to roll every model to one physical horizon. All
-curves are plotted against horizon in seconds either way.
+1. Latent prediction error
+   - autoregressive rollout L1
+   - copy-last persistence L1
 
-Per model, over every test window:
+2. Decoded task performance
+   - non-sky depth AbsRel from the predicted latent
+   - planning-group semantic mIoU from the predicted latent
 
-- latent-space metrics: mean L1 in the frozen V-JEPA 2.1 space per rollout step, for
-      rollout              autoregressive (own predictions fed back as context)
-      teacher_forced       one-step prediction from the true history
-      copy_last            copy the last context frame -- the model's own
-                           initialisation prior, so beating it is exactly
-                           "the model learned dynamics"
-      copy_previous        copy the true frame one step back -- the matching
-                           baseline for teacher_forced, whose window already
-                           holds the true frames up to the previous step
-      rollout_zero_action  rollout with the ego motion zeroed -- if this is as
-                           good as `rollout`, the model ignores its actions
-  overall and per test sequence (01 highway / 07 urban / 09 rural);
-- decoded-task metrics on a subsample of windows (--decoded-every, a frame grid
-  of anchor frames shared by all models, so every model is scored on exactly
-  the same frames at common horizons): the
-  predicted latents are pushed through the frozen depth and semantic decoders
-  and scored against the pseudolabels with exactly the code the decoder
-  evaluators use (DepthMetricAccumulator / SemanticMetricAccumulator), next to
-  the same decoders run on the true latent (the decoders' ceiling) and on the
-  copy-last-frame latent (the trivial baseline) -- world-model error isolated
-  from decoder error, in units that matter for driving;
-- figures: for a few windows, the rollout decoded to depth and semantics: a
-  first column for the last context frame t (camera I_t, pseudolabel GT at t,
-  decoders on z_t -- what the rollout starts from), then one column per step
-  (camera, pseudolabel GT, decoder on true latent, on copy latent, on
-  predicted latent).
+3. Action sensitivity
+   - real-action rollout L1
+   - zero-action rollout L1
+   - zero-action minus real-action L1
+   - direct L1 difference between real- and zero-action predictions
 
-Outputs in OUTPUTS_DIR/evals_wm:
-    <tag>/metrics.json                 everything for one model (tag = dt0.2s, dt0.5s for the
-                                       trainer's default filenames; other files get the
-                                       checkpoint stem appended so same-step runs never collide)
-    <tag>/seqXX_windowNNNNNN_{depth,semantics}.png
-    latent_l1_vs_horizon.png           all models: rollout / TF / copy / zero-action L1 vs horizon
-    decoded_metrics_vs_horizon.png     all models: depth AbsRel, delta1, mIoU, planning mIoU vs horizon
-    summary.md                         tables for all models
+All latent quantities are averaged over every latent channel, spatial token,
+and evaluated test window, while retaining one value per rollout horizon.
+Decoded metrics use the same pixel-pooled accumulators as the standalone depth
+and semantic decoder evaluations.
+
+Default outputs in OUTPUTS_DIR/evals_wm:
+
+    metrics.json
+        Combined machine-readable results for every evaluated checkpoint.
+
+    summary.md
+        The exact thesis-facing tables described above.
+
+    <tag>/metrics.json
+        Machine-readable results for one checkpoint.
+
+    depth_rollout.png
+        FoundationStereo pseudo-depth versus depth decoded from predicted
+        latents over four horizons.
+
+    semantics_rollout.png
+        OneFormer planning groups versus planning groups decoded from predicted
+        latents over four horizons.
+
+The qualitative figures use one deterministic test window shared by every
+evaluated timestep model where possible. The default is the temporal midpoint
+of the common fixed-anchor grid; --example-sequence and --example-anchor can
+override this choice.
+
+Compatibility note
+------------------
+projected_predictor_evaluator.py imports several small helpers and style
+constants from this module. Those public names are retained here:
+FIGURE_ANCHOR_GRID, MAX_FIGURE_COLUMNS, SOURCE_STYLE, VARIANT_STYLE,
+_anchor_items, _decode, _future_frame, _save_grid, and frame_stride_for.
 """
+
+from __future__ import annotations
+
 import argparse
+import gc
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from matplotlib.patches import Patch
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -66,38 +78,56 @@ from jepa_drive_wm.data.splits import SPLIT_V1
 from jepa_drive_wm.evals.common import (
     DEPTH_CHECKPOINT,
     DEVICE,
-    MUTED,
     SEMANTICS_CHECKPOINT,
     SERIES,
     WM_CHECKPOINT_DIR,
     describe_checkpoint,
-    finish_figure,
     load_depth_decoder,
     load_semantic_decoder,
     load_world_model,
     markdown_table,
-    new_figure,
-    shared_legend_below,
-    style_axes,
     write_metrics_json,
 )
-from jepa_drive_wm.evals.depth_evaluator import DepthMetricAccumulator
+from jepa_drive_wm.evals.depth_evaluator import (
+    DepthMetricAccumulator,
+    SKY_IGNORE_LUT,
+)
 from jepa_drive_wm.evals.semantics_evaluator import SemanticMetricAccumulator
 from jepa_drive_wm.models.dense_decoders.depth_decoder import DepthDecoder
 from jepa_drive_wm.models.dense_decoders.semantic_decoder import SemanticDecoder
 from jepa_drive_wm.models.predictors.ac_style.ac_predictor import VJEPA21WorldModel
 from jepa_drive_wm.paths import OUTPUTS_DIR
-from jepa_drive_wm.train.train_ac_predictor import MAX_SPEED_MPS, action_scale, forward_predictions, to_grid
-from jepa_drive_wm.train.train_depth import MAX_DEPTH, MIN_DEPTH, predict as predict_depth
-from jepa_drive_wm.train.train_semantics import predict as predict_semantics
+from jepa_drive_wm.train.train_ac_predictor import (
+    MAX_SPEED_MPS,
+    action_scale,
+    to_grid,
+)
+from jepa_drive_wm.train.train_depth import (
+    MAX_DEPTH,
+    MIN_DEPTH,
+    predict as predict_depth,
+)
+from jepa_drive_wm.train.train_semantics import (
+    NUM_CLASSES,
+    predict as predict_semantics,
+)
 from jepa_drive_wm.training_utils import autocast
-from jepa_drive_wm.viz.visualiser import class_colors
+from jepa_drive_wm.viz.visualiser import (
+    CLASS_NAMES,
+    CLASS_TO_GROUP,
+    GROUP_NAMES,
+    group_colors,
+)
+
 
 FIGURES_DIR = OUTPUTS_DIR / "evals_wm"
 TEST_SEQUENCES = list(SPLIT_V1.test_sequences)
-FRAME_PERIOD = KITTIRolloutDataset.FRAME_PERIOD  # KITTI odometry is 10 Hz
+FRAME_PERIOD = KITTIRolloutDataset.FRAME_PERIOD
 
-# Latent-space variants, in display order.
+# Retained for projected_predictor_evaluator.py compatibility.
+MAX_FIGURE_COLUMNS = 5
+FIGURE_ANCHOR_GRID = 50
+
 VARIANTS = {
     "rollout": "autoregressive rollout",
     "teacher_forced": "one-step (teacher forced)",
@@ -105,336 +135,11 @@ VARIANTS = {
     "copy_previous": "copy previous true frame",
     "rollout_zero_action": "rollout, zero action",
 }
-# Latent sources fed to the frozen decoders, in display order.
 SOURCES = {
-    "true": "true latent (decoder ceiling)",
+    "true": "true latent",
     "copy": "copy-last-frame latent",
-    "predicted": "predicted latent (rollout)",
+    "predicted": "predicted latent",
 }
-# At most this many rollout steps are shown as columns in the qualitative figures.
-MAX_FIGURE_COLUMNS = 5
-# Qualitative figures pick their windows from anchors on this frame grid, so two
-# models' figures show the same scenes.
-FIGURE_ANCHOR_GRID = 50
-
-
-def default_checkpoints() -> list[Path]:
-    """Every horizon-tagged world-model checkpoint the trainer can have written."""
-    return sorted(WM_CHECKPOINT_DIR.glob("world_model_dt*.pt"))
-
-
-def model_tag(checkpoint: dict, path: Path) -> str:
-    """
-    Names the run, its results entry and its output folder. The trainer's
-    default filename world_model_<step tag>.pt gets the bare step tag (dt0.2s,
-    dt0.5s); any other file keeps its stem too, so two runs at the same step
-    (old vs retrained) never overwrite each other.
-    """
-    tag = f"dt{checkpoint['step_seconds']:g}s"
-    return tag if path.stem == f"world_model_{tag}" else f"{tag}_{path.stem}"
-
-
-def frame_stride_for(step_seconds: float) -> int:
-    """Invert KITTIRolloutDataset.step_seconds = frame_stride * FRAME_PERIOD."""
-    stride = step_seconds / FRAME_PERIOD
-    if not math.isclose(stride, round(stride), abs_tol=1e-6):
-        raise ValueError(f"step {step_seconds}s is not a whole number of {FRAME_PERIOD}s frames")
-    return int(round(stride))
-
-
-# ----------------------------------------------------------------------------- latent metrics
-
-class LatentMetrics:
-    """Per-step mean latent L1 for each variant, pooled over windows; also per sequence."""
-
-    def __init__(self, steps: int) -> None:
-        self.steps = steps
-        self._sum: dict[str, np.ndarray] = {}
-        self._seq_sum: dict[str, dict[int, np.ndarray]] = {}
-        self._windows = 0
-        self._seq_windows: dict[int, int] = {}
-
-    def update(self, variant: str, per_window_l1: torch.Tensor, sequence_nrs: torch.Tensor) -> None:
-        """per_window_l1: [B, K] mean |pred - target| per window and step (fp32, cpu)."""
-        values = per_window_l1.double().numpy()
-        self._sum[variant] = self._sum.get(variant, np.zeros(self.steps)) + values.sum(axis=0)
-        seq_sum = self._seq_sum.setdefault(variant, {})
-        for row, seq in zip(values, sequence_nrs.tolist()):
-            seq_sum[seq] = seq_sum.get(seq, np.zeros(self.steps)) + row
-        if variant == "rollout":  # count windows once, not once per variant
-            self._windows += values.shape[0]
-            for seq in sequence_nrs.tolist():
-                self._seq_windows[seq] = self._seq_windows.get(seq, 0) + 1
-
-    @property
-    def windows(self) -> int:
-        return self._windows
-
-    def mean(self, variant: str) -> np.ndarray:
-        return self._sum[variant] / max(self._windows, 1)
-
-    def per_sequence(self, variant: str) -> dict[int, np.ndarray]:
-        return {seq: self._seq_sum[variant][seq] / self._seq_windows[seq]
-                for seq in sorted(self._seq_windows)}
-
-    def summary(self) -> dict:
-        return {
-            "windows": self._windows,
-            "windows_per_sequence": {f"{s:02d}": n for s, n in sorted(self._seq_windows.items())},
-            "variants": {
-                variant: {
-                    "l1": self.mean(variant).tolist(),
-                    "l1_mean_over_steps": float(self.mean(variant).mean()),
-                    "l1_per_sequence": {f"{s:02d}": v.tolist() for s, v in self.per_sequence(variant).items()},
-                }
-                for variant in VARIANTS if variant in self._sum
-            },
-        }
-
-
-@torch.no_grad()
-def evaluate_latent(model: VJEPA21WorldModel, loader, act_scale: torch.Tensor, steps: int) -> LatentMetrics:
-    """One pass over the test windows: per-step L1 for every variant in VARIANTS."""
-    model.eval()
-    metrics = LatentMetrics(steps)
-    H, W = model.grid_height, model.grid_width
-
-    for batch in loader:
-        context = to_grid(batch["context_latents"].to(DEVICE, non_blocking=True), H, W)
-        future = to_grid(batch["future_latents"].to(DEVICE, non_blocking=True), H, W)
-        ego_motions = batch["future_ego_motions"].to(DEVICE) / act_scale
-        sequence_nrs = batch["sequence_nr"]
-
-        with autocast(DEVICE):
-            tf_preds, ar_preds = forward_predictions(model, context, ego_motions, future)
-            zero_preds = model.rollout(context, torch.zeros_like(ego_motions))
-
-        def per_window_l1(pred: torch.Tensor) -> torch.Tensor:
-            # mean over (H, W, C) in fp32, like latent_loss, but kept per window and step
-            return (pred.float() - future).abs().mean(dim=(2, 3, 4)).cpu()
-
-        metrics.update("rollout", per_window_l1(ar_preds), sequence_nrs)
-        metrics.update("teacher_forced", per_window_l1(tf_preds), sequence_nrs)
-        metrics.update("copy_last", per_window_l1(context[:, -1:].expand_as(future)), sequence_nrs)
-        # one-step baseline: the true frame one step back (context[-1] for step 0)
-        metrics.update("copy_previous", per_window_l1(torch.cat([context[:, -1:], future[:, :-1]], dim=1)),
-                       sequence_nrs)
-        metrics.update("rollout_zero_action", per_window_l1(zero_preds), sequence_nrs)
-    return metrics
-
-
-# ----------------------------------------------------------------------------- decoded metrics
-
-def _future_frame(dataset: KITTIRolloutDataset, start_index: int, k: int) -> int:
-    """Raw frame index of rollout step k (0-based) for a window starting at start_index."""
-    return start_index + (dataset.context_length + k) * dataset.frame_stride
-
-
-def _anchor_items(dataset: KITTIRolloutDataset, every: int) -> list[int]:
-    """
-    Dataset items whose last context frame (the "anchor") lies on a fixed
-    per-sequence frame grid: anchors 0, every, 2*every, ... Step k of such a
-    window targets frame anchor + (k + 1) * frame_stride = anchor + 10 * horizon,
-    so models with different step durations score exactly the same frames at
-    common horizons. (Subsampling by window *position* would hand each model a
-    different frame subset, since the window span depends on the stride.)
-    """
-    lookup = {key: item for item, key in enumerate(dataset.index)}
-    lead = (dataset.context_length - 1) * dataset.frame_stride
-    return [lookup[(sequence_nr, anchor - lead)]
-            for sequence_nr, sequence in dataset.sequences.items()
-            for anchor in range(0, len(sequence), every)
-            if (sequence_nr, anchor - lead) in lookup]
-
-
-@torch.no_grad()
-def _decode(depth_decoder, semantic_decoder, latent_chw: torch.Tensor,
-            depth_shape: tuple[int, int], semantics_shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
-    """[1, C, H, W] latent -> (metric depth (H, W), class ids (H, W)) at pseudolabel resolution."""
-    depth = predict_depth(depth_decoder, latent_chw, depth_shape).cpu().numpy()
-    semantics = predict_semantics(semantic_decoder, latent_chw, semantics_shape).argmax(dim=1)[0]
-    return depth, semantics.to(torch.uint8).cpu().numpy()
-
-
-@torch.no_grad()
-def evaluate_decoded(
-    model: VJEPA21WorldModel,
-    dataset: KITTIRolloutDataset,
-    depth_decoder: DepthDecoder,
-    semantic_decoder: SemanticDecoder,
-    act_scale: torch.Tensor,
-    steps: int,
-    every: int,
-    max_windows: int | None = None,
-) -> dict:
-    """
-    Windows anchored on every `every`-th frame of each test sequence (see
-    _anchor_items): roll the model out, decode true / copy / predicted latents
-    at each step with the frozen decoders and score them against the
-    pseudolabels of that step's frame.
-    """
-    model.eval()
-    H, W = model.grid_height, model.grid_width
-    depth_acc = {source: [DepthMetricAccumulator() for _ in range(steps)] for source in SOURCES}
-    sem_acc = {source: [SemanticMetricAccumulator() for _ in range(steps)] for source in SOURCES}
-
-    items = _anchor_items(dataset, every)
-    if max_windows is not None:
-        items = items[:max_windows]
-
-    for n, item in enumerate(items):
-        sample = dataset[item]
-        sequence = dataset.sequences[sample["sequence_nr"].item()]
-        start_index = sample["start_index"].item()
-
-        context = to_grid(sample["context_latents"][None].to(DEVICE), H, W)
-        ego_motions = sample["future_ego_motions"][None].to(DEVICE) / act_scale
-        with autocast(DEVICE):
-            preds = model.rollout(context, ego_motions)[0].float()        # [K, H, W, C]
-        copy_chw = context[0, -1].permute(2, 0, 1)[None]                   # [1, C, H, W]
-
-        for k in range(steps):
-            frame = _future_frame(dataset, start_index, k)
-            gt_depth = sequence.get_depth(frame)
-            gt_semantics = sequence.get_semantics(frame)
-            latents = {
-                "true": sample["future_latents"][k].view(H, W, -1).permute(2, 0, 1)[None].to(DEVICE),
-                "copy": copy_chw,
-                "predicted": preds[k].permute(2, 0, 1)[None],
-            }
-            for source, latent in latents.items():
-                depth, semantics = _decode(depth_decoder, semantic_decoder, latent,
-                                           gt_depth.shape, gt_semantics.shape)
-                depth_acc[source][k].update(gt_depth, depth, gt_semantics)
-                sem_acc[source][k].update(gt_semantics, semantics)
-        if (n + 1) % 25 == 0 or n + 1 == len(items):
-            print(f"  decoded {n + 1}/{len(items)} windows", flush=True)
-
-    return {
-        "windows": len(items),
-        "every": every,
-        "anchor_frames": "last context frame on the grid 0, every, 2*every, ... of each sequence",
-        "depth": {source: [acc.summary() for acc in accs] for source, accs in depth_acc.items()},
-        "semantics": {source: [acc.summary() for acc in accs] for source, accs in sem_acc.items()},
-    }
-
-
-# ----------------------------------------------------------------------------- qualitative
-
-def _save_grid(rows, column_titles: list[str], title: str, path: Path) -> None:
-    """One figure: rows = (label, [image per column], imshow kwargs), columns = context t + steps."""
-    n_cols = len(column_titles)
-    fig, axes = plt.subplots(len(rows), n_cols, figsize=(6 * n_cols, 2.1 * len(rows)), squeeze=False)
-    for row, (label, images, kwargs) in enumerate(rows):
-        for col in range(n_cols):
-            ax = axes[row, col]
-            ax.imshow(images[col], **kwargs)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            if row == 0:
-                ax.set_title(column_titles[col])
-            if col == 0:
-                ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=9)
-    fig.suptitle(title, y=0.99)
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
-@torch.no_grad()
-def save_figures(
-    model: VJEPA21WorldModel,
-    dataset: KITTIRolloutDataset,
-    depth_decoder: DepthDecoder,
-    semantic_decoder: SemanticDecoder,
-    act_scale: torch.Tensor,
-    steps: int,
-    n_rollouts: int,
-    figures_dir: Path,
-) -> None:
-    """
-    For n_rollouts test windows evenly spaced over the FIGURE_ANCHOR_GRID
-    anchors (so every model shows the same scenes): one depth figure and one
-    semantics figure. Columns: the last context frame t (camera I_t, pseudolabel
-    GT at t, the decoders on the true latent z_t -- identical in the three
-    decoder rows, since both the copy baseline and the rollout start from z_t),
-    then up to MAX_FIGURE_COLUMNS rollout steps. Rows: camera, pseudolabel GT,
-    decoder on true latent, on copy-last latent, on predicted latent.
-    """
-    H, W = model.grid_height, model.grid_width
-    shown = sorted(set(np.linspace(0, steps - 1, min(steps, MAX_FIGURE_COLUMNS)).round().astype(int)))
-    column_titles = ["t (last context)"] + [f"t + {(k + 1) * dataset.step_seconds:.1f}s" for k in shown]
-    candidates = _anchor_items(dataset, FIGURE_ANCHOR_GRID)
-    picks = sorted(set(np.linspace(0, len(candidates) - 1, min(n_rollouts, len(candidates))).round().astype(int)))
-
-    for item in (candidates[i] for i in picks):
-        sample = dataset[item]
-        sequence_nr = sample["sequence_nr"].item()
-        start_index = sample["start_index"].item()
-        sequence = dataset.sequences[sequence_nr]
-
-        context = to_grid(sample["context_latents"][None].to(DEVICE), H, W)
-        ego_motions = sample["future_ego_motions"][None].to(DEVICE) / act_scale
-        with autocast(DEVICE):
-            preds = model.rollout(context, ego_motions)[0].float()  # [K, H, W, C]
-        copy_chw = context[0, -1].permute(2, 0, 1)[None]
-
-        # column 0: the last context frame t, everything decoded from z_t
-        anchor = _future_frame(dataset, start_index, -1)
-        gt_depth_t = sequence.get_depth(anchor)
-        gt_semantics_t = sequence.get_semantics(anchor)
-        depth_t, semantics_t = _decode(depth_decoder, semantic_decoder, copy_chw,
-                                       gt_depth_t.shape, gt_semantics_t.shape)
-        cameras, depth_gt, sem_gt = [sequence.get_image(anchor)], [gt_depth_t], [class_colors(gt_semantics_t)]
-        depth_by = {source: [depth_t] for source in SOURCES}
-        sem_by = {source: [class_colors(semantics_t)] for source in SOURCES}
-        for k in shown:
-            frame = _future_frame(dataset, start_index, k)
-            gt_depth = sequence.get_depth(frame)
-            gt_semantics = sequence.get_semantics(frame)
-            cameras.append(sequence.get_image(frame))
-            depth_gt.append(gt_depth)
-            sem_gt.append(class_colors(gt_semantics))
-            latents = {
-                "true": sample["future_latents"][k].view(H, W, -1).permute(2, 0, 1)[None].to(DEVICE),
-                "copy": copy_chw,
-                "predicted": preds[k].permute(2, 0, 1)[None],
-            }
-            for source, latent in latents.items():
-                depth, semantics = _decode(depth_decoder, semantic_decoder, latent,
-                                           gt_depth.shape, gt_semantics.shape)
-                depth_by[source].append(depth)
-                sem_by[source].append(class_colors(semantics))
-
-        depth_kwargs = dict(cmap="plasma", vmin=MIN_DEPTH, vmax=MAX_DEPTH)
-        stem = f"seq{sequence_nr:02d}_window{start_index:06d}"
-        title = (f"seq {sequence_nr:02d}, last context frame t = {anchor} "
-                 f"(window from frame {start_index}, step {dataset.step_seconds:g}s)")
-        _save_grid(
-            [
-                ("camera", cameras, {}),
-                ("FoundationStereo\ndepth", depth_gt, depth_kwargs),
-                ("depth from\ntrue latent", depth_by["true"], depth_kwargs),
-                ("depth from\ncopy-last latent", depth_by["copy"], depth_kwargs),
-                ("depth from\npredicted latent", depth_by["predicted"], depth_kwargs),
-            ],
-            column_titles, title, figures_dir / f"{stem}_depth.png",
-        )
-        _save_grid(
-            [
-                ("camera", cameras, {}),
-                ("OneFormer\nsemantics", sem_gt, {}),
-                ("semantics from\ntrue latent", sem_by["true"], {}),
-                ("semantics from\ncopy-last latent", sem_by["copy"], {}),
-                ("semantics from\npredicted latent", sem_by["predicted"], {}),
-            ],
-            column_titles, title, figures_dir / f"{stem}_semantics.png",
-        )
-
-
-# ----------------------------------------------------------------------------- comparison plots
-
 VARIANT_STYLE = {
     "rollout": dict(linestyle="-", linewidth=2.0, marker="o", markersize=4),
     "teacher_forced": dict(linestyle="--", linewidth=1.6, marker="s", markersize=3.5),
@@ -448,296 +153,1285 @@ SOURCE_STYLE = {
     "true": dict(linestyle="--", linewidth=1.2, marker="s", markersize=3),
 }
 
+# LaTeX-like typography without requiring an installed TeX distribution.
+matplotlib.rcParams.update(
+    {
+        "text.usetex": False,
+        "font.family": "serif",
+        "font.serif": [
+            "CMU Serif",
+            "Computer Modern Roman",
+            "STIX Two Text",
+            "STIXGeneral",
+            "DejaVu Serif",
+        ],
+        "mathtext.fontset": "cm",
+        "axes.titlesize": 10.5,
+        "axes.labelsize": 9.5,
+        "xtick.labelsize": 8.5,
+        "ytick.labelsize": 8.5,
+        "legend.fontsize": 8,
+        "savefig.dpi": 300,
+    }
+)
 
-def plot_latent_curves(results: dict[str, dict], path: Path) -> None:
+
+# -----------------------------------------------------------------------------
+# Checkpoints and shared indexing helpers
+# -----------------------------------------------------------------------------
+
+
+def default_checkpoints() -> list[Path]:
+    """Return every standard timestep-tagged action-conditioned checkpoint."""
+    return sorted(WM_CHECKPOINT_DIR.glob("world_model_dt*.pt"))
+
+
+def model_tag(checkpoint: dict, path: Path) -> str:
+    """Create a stable output tag without allowing same-dt runs to collide."""
+    base = f"dt{float(checkpoint['step_seconds']):g}s"
+    return base if path.stem == f"world_model_{base}" else f"{base}_{path.stem}"
+
+
+def frame_stride_for(step_seconds: float) -> int:
+    """Convert a physical model step into a whole KITTI frame stride."""
+    stride = float(step_seconds) / FRAME_PERIOD
+    if not math.isclose(stride, round(stride), abs_tol=1e-6):
+        raise ValueError(
+            f"step {step_seconds}s is not a whole number of "
+            f"{FRAME_PERIOD}s KITTI frames"
+        )
+    return int(round(stride))
+
+
+def _future_frame(dataset: KITTIRolloutDataset, start_index: int, k: int) -> int:
+    """Raw KITTI frame targeted by zero-based rollout step ``k``."""
+    return start_index + (dataset.context_length + k) * dataset.frame_stride
+
+
+def _anchor_items(dataset: KITTIRolloutDataset, every: int) -> list[int]:
     """
-    Left: latent L1 vs horizon for every model (colour) and variant (line style).
-    Right: each prediction relative to its matching copy baseline (1.0 = no
-    better than copying; below = learned dynamics): the rollouts against
-    copy-last (same context), teacher forcing against copy-previous (its window
-    already holds the true frames up to the previous step).
+    Return windows whose final context frame lies on a fixed raw-frame grid.
+
+    This makes different timestep models use the same anchor frames and, at
+    common physical horizons, the same target frames.
     """
-    fig, axes = new_figure(ncols=2, width=6.4, height=4.4)
-    ax_abs, ax_rel = axes[0]
-    baseline_of = {"rollout": "copy_last", "rollout_zero_action": "copy_last", "teacher_forced": "copy_previous"}
-    for i, (tag, result) in enumerate(results.items()):
-        color = SERIES[i % len(SERIES)]
-        horizons = np.asarray(result["horizon_seconds"])
-        variants = result["latent"]["variants"]
-        for variant, style in VARIANT_STYLE.items():
-            if variant not in variants:
-                continue
-            values = np.asarray(variants[variant]["l1"])
-            ax_abs.plot(horizons, values, color=color, label=f"{tag} - {VARIANTS[variant]}", **style)
-            if variant in baseline_of and baseline_of[variant] in variants:
-                baseline = np.asarray(variants[baseline_of[variant]]["l1"])
-                ax_rel.plot(horizons, values / baseline, color=color,
-                            label=f"{tag} - {VARIANTS[variant]}", **style)
-    ax_rel.axhline(1.0, color=MUTED, linewidth=1.0, linestyle=":")
-    ax_rel.text(ax_rel.get_xlim()[1], 1.0, " copy baseline", va="center", ha="right", fontsize=8, color=MUTED)
-    ax_rel.text(0.02, 0.95, "rollouts / copy-last;  one-step / copy-previous", transform=ax_rel.transAxes,
-                fontsize=8, color=MUTED, ha="left", va="top")
-    style_axes(ax_abs, title="Latent L1 vs horizon (test set)", xlabel="horizon (s)",
-               ylabel="mean |pred - true| in V-JEPA space")
-    style_axes(ax_rel, title="Relative to the matching copy baseline", xlabel="horizon (s)",
-               ylabel="L1 / copy-baseline L1")
-    # colour = model, line style = variant; one legend for both panels
-    bottom = shared_legend_below(fig, ax_abs, ncol=4)
-    finish_figure(fig, path, rect=(0, bottom, 1, 1))
+    if every <= 0:
+        raise ValueError("every must be positive")
 
-
-def plot_decoded_curves(results: dict[str, dict], path: Path) -> None:
-    """2x2 small multiples: depth AbsRel / delta1 (non-sky), semantic mIoU / planning mIoU vs horizon."""
-    panels = [
-        ("depth", "non-sky", "absrel", "Depth AbsRel (non-sky), lower is better"),
-        ("depth", "non-sky", "d1", "Depth delta1 (non-sky), higher is better"),
-        ("semantics", None, "miou", "Semantic mIoU (19-class), higher is better"),
-        ("semantics", None, "planning_group_miou", "Planning-group mIoU, higher is better"),
+    lookup = {key: item for item, key in enumerate(dataset.index)}
+    lead = (dataset.context_length - 1) * dataset.frame_stride
+    return [
+        lookup[(sequence_nr, anchor - lead)]
+        for sequence_nr, sequence in dataset.sequences.items()
+        for anchor in range(0, len(sequence), every)
+        if (sequence_nr, anchor - lead) in lookup
     ]
-    fig, axes = new_figure(ncols=2, nrows=2, width=6.4, height=4.2)
-    for ax, (task, scope, key, title) in zip(axes.flat, panels):
-        for i, (tag, result) in enumerate(results.items()):
-            decoded = result.get("decoded")
-            if not decoded:
-                continue
-            color = SERIES[i % len(SERIES)]
-            horizons = np.asarray(result["horizon_seconds"])
-            for source, style in SOURCE_STYLE.items():
-                per_step = decoded[task][source]
-                values = [(m[scope][key] if scope else m[key]) for m in per_step]
-                ax.plot(horizons, values, color=color, label=f"{tag} - {SOURCES[source]}", **style)
-        style_axes(ax, title=title, xlabel="horizon (s)", ylabel=key)
-    # colour = model, line style = latent source; one legend for all four panels
-    bottom = shared_legend_below(fig, axes[0, 0], ncol=3)
-    finish_figure(fig, path, rect=(0, bottom, 1, 1))
 
 
-# ----------------------------------------------------------------------------- reporting
+@torch.no_grad()
+def _decode(
+    depth_decoder: DepthDecoder,
+    semantic_decoder: SemanticDecoder,
+    latent_chw: torch.Tensor,
+    depth_shape: tuple[int, int],
+    semantics_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Decode one V-JEPA latent grid into metric depth and semantic class ids."""
+    depth = predict_depth(depth_decoder, latent_chw, depth_shape).cpu().numpy()
+    semantics = predict_semantics(
+        semantic_decoder, latent_chw, semantics_shape
+    ).argmax(dim=1)[0]
+    return depth, semantics.to(torch.uint8).cpu().numpy()
 
-def summary_markdown(results: dict[str, dict]) -> str:
+
+def _save_grid(rows, column_titles: list[str], title: str, path: Path) -> None:
+    """
+    Legacy grid helper retained for projected_predictor_evaluator.py.
+
+    ``rows`` is a sequence of ``(label, images, imshow_kwargs)`` triples.
+    """
+    n_columns = len(column_titles)
+    fig, axes = plt.subplots(
+        len(rows),
+        n_columns,
+        figsize=(6 * n_columns, 2.1 * len(rows)),
+        squeeze=False,
+    )
+    for row, (label, images, kwargs) in enumerate(rows):
+        for column in range(n_columns):
+            axis = axes[row, column]
+            axis.imshow(images[column], **kwargs)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            if row == 0:
+                axis.set_title(column_titles[column])
+            if column == 0:
+                axis.set_ylabel(
+                    label,
+                    rotation=0,
+                    ha="right",
+                    va="center",
+                    fontsize=9,
+                )
+    fig.suptitle(title, y=0.99)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+@dataclass
+class ModelSpec:
+    path: Path
+    tag: str
+    step_seconds: float
+    frame_stride: int
+    dataset: KITTIRolloutDataset
+    checkpoint_metadata: dict[str, Any]
+    example_item: int | None = None
+
+
+def prepare_specs(
+    checkpoint_paths: list[Path],
+    *,
+    context_length: int,
+    rollout_steps: int,
+) -> list[ModelSpec]:
+    """Read lightweight checkpoint metadata and build each evaluation dataset."""
+    specs: list[ModelSpec] = []
+    seen_tags: set[str] = set()
+
+    for path in checkpoint_paths:
+        checkpoint = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if "step_seconds" not in checkpoint:
+            raise KeyError(f"{path} does not record step_seconds")
+
+        tag = model_tag(checkpoint, path)
+        if tag in seen_tags:
+            raise ValueError(f"duplicate model tag {tag!r}; outputs would collide")
+        seen_tags.add(tag)
+
+        step_seconds = float(checkpoint["step_seconds"])
+        frame_stride = frame_stride_for(step_seconds)
+        recorded_stride = checkpoint.get("frame_stride")
+        if recorded_stride is not None and int(recorded_stride) != frame_stride:
+            raise ValueError(
+                f"{path}: recorded frame_stride={recorded_stride}, "
+                f"but step_seconds implies {frame_stride}"
+            )
+
+        dataset = KITTIRolloutDataset(
+            TEST_SEQUENCES,
+            context_length=context_length,
+            future_length=rollout_steps,
+            frame_stride=frame_stride,
+        )
+        if not math.isclose(dataset.step_seconds, step_seconds, abs_tol=1e-8):
+            raise RuntimeError(
+                f"{path}: dataset reports {dataset.step_seconds}s but "
+                f"checkpoint reports {step_seconds}s"
+            )
+
+        metadata = {
+            "iteration": checkpoint.get("iteration"),
+            "val_ar": checkpoint.get("val_ar"),
+            "max_speed_mps": checkpoint.get("max_speed_mps"),
+        }
+        specs.append(
+            ModelSpec(
+                path=path,
+                tag=tag,
+                step_seconds=step_seconds,
+                frame_stride=frame_stride,
+                dataset=dataset,
+                checkpoint_metadata=metadata,
+            )
+        )
+        del checkpoint
+
+    return specs
+
+
+def _anchor_lookup(dataset: KITTIRolloutDataset) -> dict[tuple[int, int], int]:
+    """Map ``(sequence, last_context_frame)`` to dataset item."""
+    lead = (dataset.context_length - 1) * dataset.frame_stride
+    return {
+        (int(sequence), int(start + lead)): item
+        for item, (sequence, start) in enumerate(dataset.index)
+    }
+
+
+def assign_shared_example(
+    specs: list[ModelSpec],
+    *,
+    requested_sequence: int | None,
+    requested_anchor: int | None,
+) -> tuple[int, int]:
+    """
+    Choose one deterministic ``(sequence, anchor frame)`` available to all models.
+
+    Unless explicitly overridden, the midpoint of the common anchors lying on
+    FIGURE_ANCHOR_GRID is selected.
+    """
+    if not specs:
+        raise ValueError("no model specifications supplied")
+
+    lookups = [_anchor_lookup(spec.dataset) for spec in specs]
+    common = set(lookups[0])
+    for lookup in lookups[1:]:
+        common.intersection_update(lookup)
+
+    if requested_sequence is not None:
+        common = {key for key in common if key[0] == requested_sequence}
+    if requested_anchor is not None:
+        common = {key for key in common if key[1] == requested_anchor}
+
+    if not common:
+        details = []
+        if requested_sequence is not None:
+            details.append(f"sequence={requested_sequence}")
+        if requested_anchor is not None:
+            details.append(f"anchor={requested_anchor}")
+        suffix = f" for {', '.join(details)}" if details else ""
+        raise RuntimeError(f"no qualitative anchor is shared by all models{suffix}")
+
+    grid_candidates = sorted(
+        key for key in common if key[1] % FIGURE_ANCHOR_GRID == 0
+    )
+    candidates = grid_candidates or sorted(common)
+    chosen = candidates[len(candidates) // 2]
+
+    for spec, lookup in zip(specs, lookups):
+        spec.example_item = lookup[chosen]
+    return chosen
+
+
+# -----------------------------------------------------------------------------
+# Latent evaluation
+# -----------------------------------------------------------------------------
+
+
+class FocusedLatentAccumulator:
+    """Dataset-level per-horizon latent metrics for the final thesis tables."""
+
+    KEYS = (
+        "autoregressive_l1",
+        "copy_last_l1",
+        "zero_action_l1",
+        "action_sensitivity_l1",
+    )
+
+    def __init__(self, steps: int) -> None:
+        self.steps = steps
+        self.sums = {
+            key: np.zeros(steps, dtype=np.float64)
+            for key in self.KEYS
+        }
+        self.windows = 0
+
+    def update(
+        self,
+        *,
+        real: torch.Tensor,
+        zero: torch.Tensor,
+        copy: torch.Tensor,
+        target: torch.Tensor,
+    ) -> None:
+        """
+        Add one batch.
+
+        Tensors have shape ``[B,K,H,W,C]``. Every quantity is first averaged
+        over H, W and C, leaving one value per window and horizon.
+        """
+        if not (real.shape == zero.shape == copy.shape == target.shape):
+            raise ValueError(
+                "latent tensors must have identical shapes: "
+                f"real={tuple(real.shape)}, zero={tuple(zero.shape)}, "
+                f"copy={tuple(copy.shape)}, target={tuple(target.shape)}"
+            )
+
+        values = {
+            "autoregressive_l1": (real.float() - target.float())
+            .abs()
+            .mean(dim=(2, 3, 4)),
+            "copy_last_l1": (copy.float() - target.float())
+            .abs()
+            .mean(dim=(2, 3, 4)),
+            "zero_action_l1": (zero.float() - target.float())
+            .abs()
+            .mean(dim=(2, 3, 4)),
+            "action_sensitivity_l1": (real.float() - zero.float())
+            .abs()
+            .mean(dim=(2, 3, 4)),
+        }
+
+        batch_size = int(real.shape[0])
+        for key, tensor in values.items():
+            self.sums[key] += tensor.detach().cpu().double().sum(dim=0).numpy()
+        self.windows += batch_size
+
+    def summary(self) -> dict[str, Any]:
+        divisor = max(self.windows, 1)
+        means = {
+            key: (value / divisor).tolist()
+            for key, value in self.sums.items()
+        }
+        means["zero_minus_real_l1"] = (
+            np.asarray(means["zero_action_l1"])
+            - np.asarray(means["autoregressive_l1"])
+        ).tolist()
+        return {"windows": self.windows, **means}
+
+
+@torch.no_grad()
+def evaluate_latent(
+    model: VJEPA21WorldModel,
+    loader: DataLoader,
+    *,
+    act_scale: torch.Tensor,
+    steps: int,
+) -> dict[str, Any]:
+    """Evaluate real-action, zero-action and copy-last predictions."""
+    model.eval()
+    accumulator = FocusedLatentAccumulator(steps)
+    height, width = model.grid_height, model.grid_width
+
+    for batch in loader:
+        context = to_grid(
+            batch["context_latents"].to(DEVICE, non_blocking=True),
+            height,
+            width,
+        )
+        target = to_grid(
+            batch["future_latents"].to(DEVICE, non_blocking=True),
+            height,
+            width,
+        )
+        actions = batch["future_ego_motions"].to(DEVICE) / act_scale
+
+        with autocast(DEVICE):
+            real = model.rollout(context, actions)
+            zero = model.rollout(context, torch.zeros_like(actions))
+
+        copy = context[:, -1:].expand_as(target)
+        accumulator.update(
+            real=real[:, :steps],
+            zero=zero[:, :steps],
+            copy=copy[:, :steps],
+            target=target[:, :steps],
+        )
+
+    return accumulator.summary()
+
+
+# -----------------------------------------------------------------------------
+# Decoded evaluation
+# -----------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def evaluate_decoded(
+    model: VJEPA21WorldModel,
+    dataset: KITTIRolloutDataset,
+    depth_decoder: DepthDecoder,
+    semantic_decoder: SemanticDecoder,
+    *,
+    act_scale: torch.Tensor,
+    steps: int,
+    every: int,
+    max_windows: int | None,
+) -> dict[str, Any]:
+    """
+    Decode only the autoregressively predicted latents.
+
+    Each horizon has an independent depth and semantic accumulator, so the
+    reported metrics are pixel-pooled over all selected target frames at that
+    horizon.
+    """
+    model.eval()
+    height, width = model.grid_height, model.grid_width
+    depth_accumulators = [DepthMetricAccumulator() for _ in range(steps)]
+    semantic_accumulators = [SemanticMetricAccumulator() for _ in range(steps)]
+
+    items = _anchor_items(dataset, every)
+    if max_windows is not None:
+        items = items[:max_windows]
+
+    for number, item in enumerate(items, start=1):
+        sample = dataset[item]
+        sequence_nr = int(sample["sequence_nr"].item())
+        sequence = dataset.sequences[sequence_nr]
+        start_index = int(sample["start_index"].item())
+
+        context = to_grid(
+            sample["context_latents"][None].to(DEVICE),
+            height,
+            width,
+        )
+        actions = sample["future_ego_motions"][None].to(DEVICE) / act_scale
+
+        with autocast(DEVICE):
+            predictions = model.rollout(context, actions)[0].float()
+
+        for step in range(steps):
+            frame = _future_frame(dataset, start_index, step)
+            target_depth = sequence.get_depth(frame)
+            target_semantics = sequence.get_semantics(frame)
+            latent = predictions[step].permute(2, 0, 1)[None]
+
+            decoded_depth, decoded_semantics = _decode(
+                depth_decoder,
+                semantic_decoder,
+                latent,
+                target_depth.shape,
+                target_semantics.shape,
+            )
+            depth_accumulators[step].update(
+                target_depth,
+                decoded_depth,
+                target_semantics,
+            )
+            semantic_accumulators[step].update(
+                target_semantics,
+                decoded_semantics,
+            )
+
+        if number % 25 == 0 or number == len(items):
+            print(f"  decoded {number}/{len(items)} windows", flush=True)
+
+    depth_absrel = [
+        float(accumulator.summary()["non-sky"]["absrel"])
+        for accumulator in depth_accumulators
+    ]
+    planning_miou = [
+        float(accumulator.summary()["planning_group_miou"])
+        for accumulator in semantic_accumulators
+    ]
+
+    return {
+        "windows": len(items),
+        "every": every,
+        "aggregation": (
+            "one pixel-pooled accumulator per horizon over fixed-grid anchor windows"
+        ),
+        "depth_non_sky_absrel": depth_absrel,
+        "semantics_planning_group_miou": planning_miou,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Qualitative evaluation
+# -----------------------------------------------------------------------------
+
+
+def _normalise_colour(pixel: np.ndarray) -> tuple[float, float, float]:
+    colour = np.asarray(pixel, dtype=np.float64).reshape(-1)[:3]
+    if colour.max(initial=0.0) > 1.0:
+        colour = colour / 255.0
+    return tuple(float(value) for value in colour)
+
+
+def _planning_colour_image(labels: np.ndarray) -> np.ndarray:
+    """Render fine Cityscapes ids using the project's planning-group colours."""
+    labels = labels.astype(np.int64, copy=False)
+    labelled = (labels >= 0) & (labels < NUM_CLASSES)
+    sky_class = CLASS_NAMES.index("sky")
+    safe = np.where(labelled, labels, sky_class).astype(np.uint8)
+    return np.asarray(group_colors(safe))
+
+
+def _planning_legend_handles() -> list[Patch]:
+    handles: list[Patch] = []
+    for group_id, name in enumerate(GROUP_NAMES):
+        members = np.flatnonzero(CLASS_TO_GROUP == group_id)
+        if members.size == 0:
+            continue
+        sample = group_colors(
+            np.array([[members[0]]], dtype=np.uint8)
+        )[0, 0]
+        handles.append(
+            Patch(
+                facecolor=_normalise_colour(sample),
+                edgecolor="none",
+                label=name,
+            )
+        )
+    return handles
+
+
+def _non_sky_display_mask(
+    depth: np.ndarray,
+    semantics: np.ndarray,
+) -> np.ndarray:
+    """Use the same depth range and semantic sky exclusion as depth evaluation."""
+    in_range = (
+        np.isfinite(depth)
+        & (depth > MIN_DEPTH)
+        & (depth < MAX_DEPTH)
+    )
+    return in_range & ~SKY_IGNORE_LUT[semantics]
+
+
+@torch.no_grad()
+def collect_qualitative_example(
+    model: VJEPA21WorldModel,
+    spec: ModelSpec,
+    depth_decoder: DepthDecoder,
+    semantic_decoder: SemanticDecoder,
+    *,
+    act_scale: torch.Tensor,
+    steps: int,
+) -> dict[str, Any]:
+    """Collect one predicted rollout and its paired pseudo-labels on CPU."""
+    if spec.example_item is None:
+        raise RuntimeError("qualitative example item has not been assigned")
+
+    dataset = spec.dataset
+    sample = dataset[spec.example_item]
+    sequence_nr = int(sample["sequence_nr"].item())
+    start_index = int(sample["start_index"].item())
+    sequence = dataset.sequences[sequence_nr]
+
+    height, width = model.grid_height, model.grid_width
+    context = to_grid(
+        sample["context_latents"][None].to(DEVICE),
+        height,
+        width,
+    )
+    actions = sample["future_ego_motions"][None].to(DEVICE) / act_scale
+
+    with autocast(DEVICE):
+        predictions = model.rollout(context, actions)[0].float()
+
+    target_depths: list[np.ndarray] = []
+    predicted_depths: list[np.ndarray] = []
+    depth_masks: list[np.ndarray] = []
+    target_semantics: list[np.ndarray] = []
+    predicted_semantics: list[np.ndarray] = []
+    future_frames: list[int] = []
+
+    for step in range(steps):
+        frame = _future_frame(dataset, start_index, step)
+        target_depth = sequence.get_depth(frame)
+        target_semantic = sequence.get_semantics(frame)
+        latent = predictions[step].permute(2, 0, 1)[None]
+
+        decoded_depth, decoded_semantic = _decode(
+            depth_decoder,
+            semantic_decoder,
+            latent,
+            target_depth.shape,
+            target_semantic.shape,
+        )
+
+        target_depths.append(np.asarray(target_depth))
+        predicted_depths.append(np.asarray(decoded_depth))
+        depth_masks.append(_non_sky_display_mask(target_depth, target_semantic))
+        target_semantics.append(np.asarray(target_semantic))
+        predicted_semantics.append(np.asarray(decoded_semantic))
+        future_frames.append(int(frame))
+
+    anchor_frame = _future_frame(dataset, start_index, -1)
+    return {
+        "tag": spec.tag,
+        "step_seconds": spec.step_seconds,
+        "horizons": [
+            (step + 1) * spec.step_seconds
+            for step in range(steps)
+        ],
+        "sequence": sequence_nr,
+        "anchor_frame": int(anchor_frame),
+        "future_frames": future_frames,
+        "target_depths": target_depths,
+        "predicted_depths": predicted_depths,
+        "depth_masks": depth_masks,
+        "target_semantics": target_semantics,
+        "predicted_semantics": predicted_semantics,
+    }
+
+
+def plot_depth_rollouts(
+    examples: list[dict[str, Any]],
+    path: Path,
+) -> Path:
+    """Two rows per model: FoundationStereo and predicted-latent depth."""
+    if not examples:
+        raise ValueError("no qualitative examples supplied")
+
+    steps = len(examples[0]["horizons"])
+    rows = 2 * len(examples)
+    fig, axes = plt.subplots(
+        rows,
+        steps,
+        figsize=(3.15 * steps + 0.6, 1.78 * rows + 0.65),
+        squeeze=False,
+    )
+
+    colour_map = plt.get_cmap("plasma").copy()
+    colour_map.set_bad("white")
+    normalisation = LogNorm(vmin=MIN_DEPTH, vmax=MAX_DEPTH)
+    last_image = None
+
+    for model_index, example in enumerate(examples):
+        target_row = 2 * model_index
+        prediction_row = target_row + 1
+
+        for step in range(steps):
+            mask = example["depth_masks"][step]
+            target = np.ma.masked_where(
+                ~mask,
+                example["target_depths"][step],
+            )
+            prediction = np.ma.masked_where(
+                ~mask,
+                example["predicted_depths"][step],
+            )
+
+            axes[target_row, step].imshow(
+                target,
+                cmap=colour_map,
+                norm=normalisation,
+            )
+            last_image = axes[prediction_row, step].imshow(
+                prediction,
+                cmap=colour_map,
+                norm=normalisation,
+            )
+
+            axes[target_row, step].set_title(
+                f"$t+{example['horizons'][step]:.1f}\\,\\mathrm{{s}}$",
+                pad=6,
+            )
+
+            for row in (target_row, prediction_row):
+                axis = axes[row, step]
+                axis.set_xticks([])
+                axis.set_yticks([])
+                for spine in axis.spines.values():
+                    spine.set_visible(False)
+
+        model_label = (
+            f"{example['step_seconds']:g} s-step model\n"
+            f"seq. {example['sequence']:02d}, anchor {example['anchor_frame']}"
+        )
+        axes[target_row, 0].set_ylabel(
+            model_label + "\nFoundationStereo",
+            rotation=0,
+            ha="right",
+            va="center",
+            labelpad=16,
+            fontsize=8.5,
+        )
+        axes[prediction_row, 0].set_ylabel(
+            "Predicted-latent\ndecode",
+            rotation=0,
+            ha="right",
+            va="center",
+            labelpad=16,
+            fontsize=8.5,
+        )
+
+        if model_index > 0:
+            separator_y = axes[target_row, 0].get_position().y1
+            fig.add_artist(
+                plt.Line2D(
+                    [0.08, 0.93],
+                    [separator_y + 0.012, separator_y + 0.012],
+                    transform=fig.transFigure,
+                    color="#d0d0d0",
+                    linewidth=0.8,
+                )
+            )
+
+    fig.suptitle(
+        "Depth decoded from autoregressively predicted V-JEPA latents",
+        x=0.08,
+        ha="left",
+        fontsize=11,
+    )
+    fig.subplots_adjust(
+        left=0.17,
+        right=0.91,
+        top=0.92,
+        bottom=0.06,
+        wspace=0.025,
+        hspace=0.08,
+    )
+
+    if last_image is not None:
+        colour_axis = fig.add_axes([0.925, 0.085, 0.016, 0.78])
+        colour_bar = fig.colorbar(last_image, cax=colour_axis)
+        colour_bar.set_label("Depth (m, logarithmic scale)", fontsize=8.5)
+        colour_bar.set_ticks([1, 2, 5, 10, 20, 40, 80])
+        colour_bar.set_ticklabels(["1", "2", "5", "10", "20", "40", "80"])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_semantic_rollouts(
+    examples: list[dict[str, Any]],
+    path: Path,
+) -> Path:
+    """Two rows per model: OneFormer and predicted-latent planning groups."""
+    if not examples:
+        raise ValueError("no qualitative examples supplied")
+
+    steps = len(examples[0]["horizons"])
+    rows = 2 * len(examples)
+    fig, axes = plt.subplots(
+        rows,
+        steps,
+        figsize=(3.15 * steps + 0.6, 1.78 * rows + 0.95),
+        squeeze=False,
+    )
+
+    for model_index, example in enumerate(examples):
+        target_row = 2 * model_index
+        prediction_row = target_row + 1
+
+        for step in range(steps):
+            axes[target_row, step].imshow(
+                _planning_colour_image(example["target_semantics"][step])
+            )
+            axes[prediction_row, step].imshow(
+                _planning_colour_image(example["predicted_semantics"][step])
+            )
+            axes[target_row, step].set_title(
+                f"$t+{example['horizons'][step]:.1f}\\,\\mathrm{{s}}$",
+                pad=6,
+            )
+
+            for row in (target_row, prediction_row):
+                axis = axes[row, step]
+                axis.set_xticks([])
+                axis.set_yticks([])
+                for spine in axis.spines.values():
+                    spine.set_visible(False)
+
+        model_label = (
+            f"{example['step_seconds']:g} s-step model\n"
+            f"seq. {example['sequence']:02d}, anchor {example['anchor_frame']}"
+        )
+        axes[target_row, 0].set_ylabel(
+            model_label + "\nOneFormer",
+            rotation=0,
+            ha="right",
+            va="center",
+            labelpad=16,
+            fontsize=8.5,
+        )
+        axes[prediction_row, 0].set_ylabel(
+            "Predicted-latent\ndecode",
+            rotation=0,
+            ha="right",
+            va="center",
+            labelpad=16,
+            fontsize=8.5,
+        )
+
+    handles = _planning_legend_handles()
+    legend_rows = max(1, math.ceil(len(handles) / 5))
+    bottom = 0.07 + 0.035 * legend_rows
+
+    fig.suptitle(
+        "Planning groups decoded from autoregressively predicted V-JEPA latents",
+        x=0.08,
+        ha="left",
+        fontsize=11,
+    )
+    fig.legend(
+        handles=handles,
+        loc="lower center",
+        ncol=min(5, len(handles)),
+        frameon=False,
+        columnspacing=1.3,
+        handlelength=1.4,
+        bbox_to_anchor=(0.55, 0.01),
+    )
+    fig.subplots_adjust(
+        left=0.17,
+        right=0.995,
+        top=0.92,
+        bottom=bottom,
+        wspace=0.025,
+        hspace=0.08,
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+# -----------------------------------------------------------------------------
+# Reporting
+# -----------------------------------------------------------------------------
+
+
+def _horizon_label(value: float) -> str:
+    return f"t+{value:.1f} s"
+
+
+def summary_markdown(results: dict[str, dict[str, Any]]) -> str:
+    """Create the exact focused thesis-facing Markdown tables."""
     lines = [
-        "# ac-style world models -- test set (SPLIT_V1: sequences "
-        + ", ".join(f"{s:02d}" for s in TEST_SEQUENCES) + ")",
+        "# Action-conditioned latent predictors -- held-out test set",
         "",
-        "Latent L1 = mean |pred - true| in the frozen V-JEPA 2.1 space, pooled over all test windows "
-        "(same quantity as the trainer's tf/ar losses). Decoded metrics push latents through the "
-        "frozen depth / semantic decoders and score them against the pseudolabels with the decoder "
-        "evaluators' code.",
+        "test sequences: "
+        + ", ".join(f"{sequence:02d}" for sequence in TEST_SEQUENCES),
+        "",
+        "Latent L1 is the mean absolute difference over every spatial patch, "
+        "all 768 feature channels, and all evaluated test windows, reported "
+        "separately at each rollout horizon.",
         "",
     ]
+
     for tag, result in results.items():
+        latent = result["latent"]
         horizons = result["horizon_seconds"]
-        variants = result["latent"]["variants"]
-        lines += [
-            f"## {tag}",
-            "",
-            f"checkpoint: `{result['checkpoint']}`  ",
-            f"context {result['context_length']} frames, frame stride {result['frame_stride']}, "
-            f"{result['horizon_steps']} rollout steps of {result['step_seconds']:g}s, "
-            f"{result['latent']['windows']} test windows",
-            "",
-            "### Latent L1 per step",
-            "",
-            markdown_table(
-                ["horizon (s)", *[VARIANTS[v] for v in VARIANTS if v in variants], "rollout / copy"],
-                [[f"+{h:.1f}", *[variants[v]["l1"][k] for v in VARIANTS if v in variants],
-                  variants["rollout"]["l1"][k] / variants["copy_last"]["l1"][k]]
-                 for k, h in enumerate(horizons)],
-            ),
-            "",
-            "### Rollout L1 per sequence",
-            "",
-            markdown_table(
-                ["seq", "windows", *[f"rollout +{h:.1f}s" for h in horizons],
-                 *[f"copy +{h:.1f}s" for h in (horizons[0], horizons[-1])]],
-                [[seq, result["latent"]["windows_per_sequence"][seq],
-                  *variants["rollout"]["l1_per_sequence"][seq],
-                  variants["copy_last"]["l1_per_sequence"][seq][0],
-                  variants["copy_last"]["l1_per_sequence"][seq][-1]]
-                 for seq in result["latent"]["windows_per_sequence"]],
-            ),
-            "",
-        ]
-        decoded = result.get("decoded")
-        if decoded:
-            rows = []
-            for k, h in enumerate(horizons):
-                for source in SOURCES:
-                    d = decoded["depth"][source][k]
-                    s = decoded["semantics"][source][k]
-                    rows.append([f"+{h:.1f}  {SOURCES[source]}", d["non-sky"]["absrel"], d["non-sky"]["rmse"],
-                                 d["non-sky"]["d1"], d["vehicle"]["absrel"], s["miou"],
-                                 s["planning_group_miou"], s["drivable_iou"], s["drivable_boundary_iou"],
-                                 s["traffic_participant_iou"], s["car_iou"]])
-            lines += [
-                f"### Decoded-task metrics ({decoded['windows']} windows anchored every "
-                f"{decoded['every']}th frame; identical frames for all models at common horizons)",
+        lines.extend(
+            [
+                f"## {result['step_seconds']:g} s-step model (`{tag}`)",
+                "",
+                f"checkpoint: `{result['checkpoint']}`  ",
+                f"context: {result['context_length']} frames; "
+                f"rollout: {result['horizon_steps']} steps; "
+                f"latent windows: {latent['windows']}",
+                "",
+                "### Latent prediction error",
                 "",
                 markdown_table(
-                    ["horizon / latent source", "AbsRel", "RMSE (m)", "delta1", "vehicle AbsRel",
-                     "mIoU", "planning mIoU", "drivable IoU", "drivable bIoU", "traffic IoU", "car IoU"],
-                    rows,
+                    [
+                        "Prediction horizon",
+                        "Autoregressive latent L1 ↓",
+                        "Copy-last latent L1 ↓",
+                    ],
+                    [
+                        [
+                            _horizon_label(horizon),
+                            latent["autoregressive_l1"][index],
+                            latent["copy_last_l1"][index],
+                        ]
+                        for index, horizon in enumerate(horizons)
+                    ],
                 ),
                 "",
-                "depth scope non-sky unless stated; semantics IoU dataset-level over the sampled frames.",
+            ]
+        )
+
+        decoded = result.get("decoded")
+        if decoded is not None:
+            lines.extend(
+                [
+                    "### Decoded performance: depth",
+                    "",
+                    markdown_table(
+                        [
+                            "Prediction horizon",
+                            "Predicted-latent non-sky AbsRel ↓",
+                        ],
+                        [
+                            [
+                                _horizon_label(horizon),
+                                decoded["depth_non_sky_absrel"][index],
+                            ]
+                            for index, horizon in enumerate(horizons)
+                        ],
+                    ),
+                    "",
+                    "### Decoded performance: semantic segmentation",
+                    "",
+                    markdown_table(
+                        [
+                            "Prediction horizon",
+                            "Predicted-latent planning-group mIoU ↑",
+                        ],
+                        [
+                            [
+                                _horizon_label(horizon),
+                                decoded["semantics_planning_group_miou"][index],
+                            ]
+                            for index, horizon in enumerate(horizons)
+                        ],
+                    ),
+                    "",
+                    f"Decoded metrics use {decoded['windows']} fixed-grid test "
+                    f"windows (every {decoded['every']} raw frames) and are "
+                    "pooled over pixels separately at each horizon.",
+                    "",
+                ]
+            )
+
+        lines.extend(
+            [
+                "### Action sensitivity",
+                "",
+                markdown_table(
+                    [
+                        "Prediction horizon",
+                        "Real-action L1 ↓",
+                        "Zero-action L1 ↓",
+                        "Zero − real L1 ↑",
+                        "Action sensitivity",
+                    ],
+                    [
+                        [
+                            _horizon_label(horizon),
+                            latent["autoregressive_l1"][index],
+                            latent["zero_action_l1"][index],
+                            latent["zero_minus_real_l1"][index],
+                            latent["action_sensitivity_l1"][index],
+                        ]
+                        for index, horizon in enumerate(horizons)
+                    ],
+                ),
+                "",
+                "`Zero − real L1` is positive when supplying the recorded ego "
+                "motion improves target prediction. `Action sensitivity` is the "
+                "direct mean absolute difference between the real-action and "
+                "zero-action predicted latents.",
                 "",
             ]
+        )
+
+        example = result.get("qualitative_example")
+        if example:
+            lines.extend(
+                [
+                    "### Qualitative example",
+                    "",
+                    f"Sequence {example['sequence']:02d}, final context frame "
+                    f"{example['anchor_frame']}; future frames: "
+                    + ", ".join(str(frame) for frame in example["future_frames"])
+                    + ".",
+                    "",
+                ]
+            )
+
     return "\n".join(lines)
 
 
-def print_overview(tag: str, result: dict) -> None:
-    horizons = result["horizon_seconds"]
-    variants = result["latent"]["variants"]
-    print(f"\n[{tag}] latent L1 over {result['latent']['windows']} test windows:")
-    for k, h in enumerate(horizons):
-        print(f"  step +{h:.1f}s | rollout {variants['rollout']['l1'][k]:.4f} | "
-              f"one-step (TF) {variants['teacher_forced']['l1'][k]:.4f} | "
-              f"copy-last-frame {variants['copy_last']['l1'][k]:.4f} | "
-              f"copy-previous {variants['copy_previous']['l1'][k]:.4f} | "
-              f"zero-action rollout {variants['rollout_zero_action']['l1'][k]:.4f} | "
-              f"rollout/copy {variants['rollout']['l1'][k] / variants['copy_last']['l1'][k]:.3f}")
-    print(f"  per sequence (rollout L1 at +{horizons[0]:.1f}s / +{horizons[-1]:.1f}s, copy at the same):")
-    for seq, n in result["latent"]["windows_per_sequence"].items():
-        r = variants["rollout"]["l1_per_sequence"][seq]
-        c = variants["copy_last"]["l1_per_sequence"][seq]
-        print(f"    seq {seq} ({n} windows): rollout {r[0]:.4f} / {r[-1]:.4f}   copy {c[0]:.4f} / {c[-1]:.4f}")
+def print_overview(tag: str, result: dict[str, Any]) -> None:
+    """Concise console view of the same core quantities."""
+    latent = result["latent"]
     decoded = result.get("decoded")
-    if decoded:
-        print(f"  decoded-task metrics ({decoded['windows']} windows):")
-        for k, h in enumerate(horizons):
-            for source in SOURCES:
-                d = decoded["depth"][source][k]["non-sky"]
-                s = decoded["semantics"][source][k]
-                print(f"    +{h:.1f}s {SOURCES[source]:<30} depth AbsRel {d['absrel']:.4f} d1 {d['d1']:.4f} | "
-                      f"mIoU {s['miou']:.4f} planning mIoU {s['planning_group_miou']:.4f} "
-                      f"drivable IoU {s['drivable_iou']:.4f} traffic IoU {s['traffic_participant_iou']:.4f}")
-
-
-# ----------------------------------------------------------------------------- main
-
-def evaluate_checkpoint(path: Path, args, depth_decoder, semantic_decoder) -> tuple[str, dict]:
-    model, checkpoint = load_world_model(path)
-    checkpoint_line = describe_checkpoint(path, checkpoint)
-    print(f"\nloaded {checkpoint_line}")
-
-    # The action normalisation is part of the model contract (see train_ac_predictor).
-    assert checkpoint["max_speed_mps"] == MAX_SPEED_MPS, "MAX_SPEED_MPS changed since training"
-    step_seconds = float(checkpoint["step_seconds"])
-    act_scale = action_scale(step_seconds).to(DEVICE)
-    frame_stride = frame_stride_for(step_seconds)
-    if args.horizon_seconds is not None:
-        steps = max(1, int(round(args.horizon_seconds / step_seconds)))
-    else:
-        steps = args.rollout_steps
-    tag = model_tag(checkpoint, path)
-    figures_dir = args.figures_dir / tag
-
-    dataset = KITTIRolloutDataset(
-        TEST_SEQUENCES,
-        context_length=args.context_length,
-        future_length=steps,
-        frame_stride=frame_stride,
+    print(f"\n[{tag}] {result['step_seconds']:g} s-step model")
+    print(
+        f"{'horizon':<10} {'AR L1':>9} {'copy L1':>9} "
+        f"{'zero L1':>9} {'zero-real':>10} {'sensitivity':>12}"
     )
-    assert math.isclose(dataset.step_seconds, step_seconds), (dataset.step_seconds, step_seconds)
-    print(f"[{tag}] {len(dataset)} test windows: context {args.context_length} x {step_seconds:g}s, "
-          f"{steps} rollout steps of {step_seconds:g}s (horizon {steps * step_seconds:.1f}s)")
+    for index, horizon in enumerate(result["horizon_seconds"]):
+        print(
+            f"{_horizon_label(horizon):<10} "
+            f"{latent['autoregressive_l1'][index]:>9.4f} "
+            f"{latent['copy_last_l1'][index]:>9.4f} "
+            f"{latent['zero_action_l1'][index]:>9.4f} "
+            f"{latent['zero_minus_real_l1'][index]:>10.4f} "
+            f"{latent['action_sensitivity_l1'][index]:>12.4f}"
+        )
 
-    latent_set = dataset if args.max_windows is None else Subset(dataset, range(min(args.max_windows, len(dataset))))
-    loader = DataLoader(latent_set, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers, pin_memory=False)
-    latent = evaluate_latent(model, loader, act_scale, steps)
+    if decoded:
+        print("\nDecoded predicted-latent metrics")
+        print(f"{'horizon':<10} {'AbsRel':>10} {'planning mIoU':>16}")
+        for index, horizon in enumerate(result["horizon_seconds"]):
+            print(
+                f"{_horizon_label(horizon):<10} "
+                f"{decoded['depth_non_sky_absrel'][index]:>10.4f} "
+                f"{decoded['semantics_planning_group_miou'][index]:>16.4f}"
+            )
 
-    result = {
+
+# -----------------------------------------------------------------------------
+# Main evaluation
+# -----------------------------------------------------------------------------
+
+
+def evaluate_spec(
+    spec: ModelSpec,
+    args: argparse.Namespace,
+    depth_decoder: DepthDecoder,
+    semantic_decoder: SemanticDecoder,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Load one model, run every requested evaluation, then release it."""
+    model, checkpoint = load_world_model(spec.path)
+    checkpoint_line = describe_checkpoint(spec.path, checkpoint)
+
+    recorded_max_speed = checkpoint.get("max_speed_mps")
+    if recorded_max_speed is not None and not math.isclose(
+        float(recorded_max_speed),
+        MAX_SPEED_MPS,
+    ):
+        raise ValueError(
+            f"{spec.path}: checkpoint MAX_SPEED_MPS={recorded_max_speed}, "
+            f"current code uses {MAX_SPEED_MPS}"
+        )
+
+    print(
+        f"\nloaded {checkpoint_line}\n"
+        f"[{spec.tag}] {len(spec.dataset)} test windows; "
+        f"{args.rollout_steps} steps of {spec.step_seconds:g}s"
+    )
+
+    latent_items: Any = range(len(spec.dataset))
+    if args.max_windows is not None:
+        latent_items = range(min(args.max_windows, len(spec.dataset)))
+    latent_loader = DataLoader(
+        Subset(spec.dataset, list(latent_items)),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=False,
+    )
+
+    act_scale = action_scale(spec.step_seconds).to(DEVICE)
+    latent = evaluate_latent(
+        model,
+        latent_loader,
+        act_scale=act_scale,
+        steps=args.rollout_steps,
+    )
+
+    result: dict[str, Any] = {
         "checkpoint": checkpoint_line,
-        "checkpoint_path": str(path),
+        "checkpoint_path": str(spec.path),
         "iteration": checkpoint.get("iteration"),
         "val_ar": checkpoint.get("val_ar"),
-        "step_seconds": step_seconds,
-        "frame_stride": frame_stride,
+        "step_seconds": spec.step_seconds,
+        "frame_stride": spec.frame_stride,
         "context_length": args.context_length,
-        "horizon_steps": steps,
-        "horizon_seconds": [(k + 1) * step_seconds for k in range(steps)],
+        "horizon_steps": args.rollout_steps,
+        "horizon_seconds": [
+            (step + 1) * spec.step_seconds
+            for step in range(args.rollout_steps)
+        ],
         "test_sequences": TEST_SEQUENCES,
-        "latent": latent.summary(),
+        "latent": latent,
     }
-    if not args.skip_decoded:
-        print(f"[{tag}] decoding every {args.decoded_every}th window through the frozen decoders ...")
-        result["decoded"] = evaluate_decoded(model, dataset, depth_decoder, semantic_decoder, act_scale,
-                                             steps, args.decoded_every, args.max_windows)
-    print_overview(tag, result)
 
-    figures_dir.mkdir(parents=True, exist_ok=True)
-    write_metrics_json(result, figures_dir / "metrics.json")
-    if args.rollouts:
-        save_figures(model, dataset, depth_decoder, semantic_decoder, act_scale, steps, args.rollouts, figures_dir)
-        print(f"[{tag}] rollout figures saved to {figures_dir}")
-    return tag, result
+    if not args.skip_decoded:
+        print(
+            f"[{spec.tag}] decoding every {args.decoded_every}th anchor window ..."
+        )
+        result["decoded"] = evaluate_decoded(
+            model,
+            spec.dataset,
+            depth_decoder,
+            semantic_decoder,
+            act_scale=act_scale,
+            steps=args.rollout_steps,
+            every=args.decoded_every,
+            max_windows=args.max_windows,
+        )
+
+    qualitative = None
+    if not args.skip_figures:
+        qualitative = collect_qualitative_example(
+            model,
+            spec,
+            depth_decoder,
+            semantic_decoder,
+            act_scale=act_scale,
+            steps=args.rollout_steps,
+        )
+        result["qualitative_example"] = {
+            "sequence": qualitative["sequence"],
+            "anchor_frame": qualitative["anchor_frame"],
+            "future_frames": qualitative["future_frames"],
+        }
+
+    print_overview(spec.tag, result)
+
+    tag_dir = args.figures_dir / spec.tag
+    tag_dir.mkdir(parents=True, exist_ok=True)
+    write_metrics_json(result, tag_dir / "metrics.json")
+
+    del model
+    del checkpoint
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result, qualitative
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate the trained ac-style world models on the test split")
-    parser.add_argument("--checkpoints", type=Path, nargs="*", default=None,
-                        help="world-model checkpoints (default: every checkpoints_wm/world_model_dt*.pt)")
-    parser.add_argument("--context-length", type=int, default=4,
-                        help="context frames per window (matches the trainer default)")
-    parser.add_argument("--rollout-steps", type=int, default=4,
-                        help="rollout steps per model (0.2s model -> 0.8s, 0.5s model -> 2.0s)")
-    parser.add_argument("--horizon-seconds", type=float, default=None,
-                        help="instead of --rollout-steps: roll every model out to this physical horizon")
-    parser.add_argument("--rollouts", type=int, default=6,
-                        help="evenly-spaced test windows to visualise per model (0 disables)")
-    parser.add_argument("--decoded-every", type=int, default=20,
-                        help="decode every Nth test window for the decoded-task metrics")
-    parser.add_argument("--skip-decoded", action="store_true", help="latent metrics only")
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser = argparse.ArgumentParser(
+        description="Focused evaluation of action-conditioned V-JEPA predictors"
+    )
+    parser.add_argument(
+        "--checkpoints",
+        type=Path,
+        nargs="*",
+        default=None,
+        help=(
+            "predictor checkpoints; by default evaluates every "
+            "checkpoints_wm/world_model_dt*.pt"
+        ),
+    )
+    parser.add_argument(
+        "--context-length",
+        type=int,
+        default=4,
+        help="number of cached V-JEPA context frames",
+    )
+    parser.add_argument(
+        "--rollout-steps",
+        type=int,
+        default=4,
+        help="number of autoregressive future states to evaluate",
+    )
+    parser.add_argument(
+        "--decoded-every",
+        type=int,
+        default=20,
+        help="decode windows whose final context frame lies every N raw frames",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="batch size for the full latent-space pass",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--max-windows", type=int, default=None,
-                        help="cap the windows scored (latent and decoded) -- smoke tests")
-    parser.add_argument("--depth-checkpoint", type=Path, default=DEPTH_CHECKPOINT)
-    parser.add_argument("--semantics-checkpoint", type=Path, default=SEMANTICS_CHECKPOINT)
-    parser.add_argument("--figures-dir", type=Path, default=FIGURES_DIR)
-    parser.add_argument("--replot", action="store_true",
-                        help="skip evaluation: rebuild summary.md and the comparison plots from the "
-                             "per-model <figures-dir>/<tag>/metrics.json files of an earlier run")
+    parser.add_argument(
+        "--max-windows",
+        type=int,
+        default=None,
+        help="cap latent and decoded windows for a smoke test",
+    )
+    parser.add_argument(
+        "--skip-decoded",
+        action="store_true",
+        help="evaluate latent quantities only",
+    )
+    parser.add_argument(
+        "--skip-figures",
+        action="store_true",
+        help="do not generate the two qualitative rollout figures",
+    )
+    parser.add_argument(
+        "--example-sequence",
+        type=int,
+        default=None,
+        help="optional held-out sequence for the shared qualitative example",
+    )
+    parser.add_argument(
+        "--example-anchor",
+        type=int,
+        default=None,
+        help="optional raw frame id of the final context frame",
+    )
+    parser.add_argument(
+        "--depth-checkpoint",
+        type=Path,
+        default=DEPTH_CHECKPOINT,
+    )
+    parser.add_argument(
+        "--semantics-checkpoint",
+        type=Path,
+        default=SEMANTICS_CHECKPOINT,
+    )
+    parser.add_argument(
+        "--figures-dir",
+        type=Path,
+        default=FIGURES_DIR,
+    )
     args = parser.parse_args()
 
-    if args.replot:
-        results = {p.parent.name: json.loads(p.read_text())
-                   for p in sorted(args.figures_dir.glob("*/metrics.json"))}
-        if not results:
-            raise SystemExit(f"no <tag>/metrics.json under {args.figures_dir} to replot")
-        print("replotting from: " + ", ".join(results))
-        write_summary(results, args.figures_dir)
-        return
+    if args.rollout_steps <= 0:
+        raise SystemExit("--rollout-steps must be positive")
+    if args.decoded_every <= 0:
+        raise SystemExit("--decoded-every must be positive")
+    if args.batch_size <= 0:
+        raise SystemExit("--batch-size must be positive")
 
-    checkpoints = args.checkpoints or default_checkpoints()
-    if not checkpoints:
-        raise SystemExit(f"no world-model checkpoints found in {WM_CHECKPOINT_DIR}")
+    checkpoint_paths = args.checkpoints or default_checkpoints()
+    if not checkpoint_paths:
+        raise SystemExit(
+            f"no world-model checkpoints found in {WM_CHECKPOINT_DIR}"
+        )
+    missing = [path for path in checkpoint_paths if not path.exists()]
+    if missing:
+        raise SystemExit(
+            "checkpoint files do not exist: "
+            + ", ".join(str(path) for path in missing)
+        )
 
-    depth_decoder, depth_ckpt = load_depth_decoder(args.depth_checkpoint)
-    semantic_decoder, sem_ckpt = load_semantic_decoder(args.semantics_checkpoint)
-    print(f"depth decoder:    {describe_checkpoint(args.depth_checkpoint, depth_ckpt)}")
-    print(f"semantic decoder: {describe_checkpoint(args.semantics_checkpoint, sem_ckpt)}")
+    specs = prepare_specs(
+        list(checkpoint_paths),
+        context_length=args.context_length,
+        rollout_steps=args.rollout_steps,
+    )
 
-    results: dict[str, dict] = {}
-    for path in checkpoints:
-        tag, result = evaluate_checkpoint(path, args, depth_decoder, semantic_decoder)
-        if tag in results:
-            raise SystemExit(f"duplicate model tag {tag!r} for {path}: results would overwrite each other")
-        results[tag] = result
+    if not args.skip_figures:
+        sequence, anchor = assign_shared_example(
+            specs,
+            requested_sequence=args.example_sequence,
+            requested_anchor=args.example_anchor,
+        )
+        print(
+            f"qualitative example shared across models: "
+            f"sequence {sequence:02d}, anchor frame {anchor}"
+        )
 
-    write_summary(results, args.figures_dir)
+    depth_decoder, depth_checkpoint = load_depth_decoder(args.depth_checkpoint)
+    semantic_decoder, semantic_checkpoint = load_semantic_decoder(
+        args.semantics_checkpoint
+    )
+    print(
+        "depth decoder:    "
+        + describe_checkpoint(args.depth_checkpoint, depth_checkpoint)
+    )
+    print(
+        "semantic decoder: "
+        + describe_checkpoint(args.semantics_checkpoint, semantic_checkpoint)
+    )
 
+    results: dict[str, dict[str, Any]] = {}
+    qualitative_examples: list[dict[str, Any]] = []
 
-def write_summary(results: dict[str, dict], figures_dir: Path) -> None:
-    """Cross-model outputs: comparison plots, summary.md and the combined metrics.json."""
-    figures_dir.mkdir(parents=True, exist_ok=True)
-    plot_latent_curves(results, figures_dir / "latent_l1_vs_horizon.png")
-    if any("decoded" in r for r in results.values()):
-        plot_decoded_curves(results, figures_dir / "decoded_metrics_vs_horizon.png")
-    (figures_dir / "summary.md").write_text(summary_markdown(results))
-    write_metrics_json({"models": results}, figures_dir / "metrics.json")
-    print(f"\nsummary + comparison plots saved to {figures_dir}")
+    for spec in specs:
+        result, qualitative = evaluate_spec(
+            spec,
+            args,
+            depth_decoder,
+            semantic_decoder,
+        )
+        results[spec.tag] = result
+        if qualitative is not None:
+            qualitative_examples.append(qualitative)
+
+    args.figures_dir.mkdir(parents=True, exist_ok=True)
+    combined = {
+        "evaluation": "focused action-conditioned latent predictor",
+        "models": results,
+    }
+    write_metrics_json(combined, args.figures_dir / "metrics.json")
+    (args.figures_dir / "summary.md").write_text(
+        summary_markdown(results)
+    )
+
+    if qualitative_examples:
+        depth_path = plot_depth_rollouts(
+            qualitative_examples,
+            args.figures_dir / "depth_rollout.png",
+        )
+        semantics_path = plot_semantic_rollouts(
+            qualitative_examples,
+            args.figures_dir / "semantics_rollout.png",
+        )
+        print(f"\ndepth figure:       {depth_path}")
+        print(f"semantics figure:   {semantics_path}")
+
+    print(f"combined metrics:   {args.figures_dir / 'metrics.json'}")
+    print(f"thesis tables:      {args.figures_dir / 'summary.md'}")
 
 
 if __name__ == "__main__":
