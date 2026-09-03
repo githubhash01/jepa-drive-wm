@@ -1,181 +1,325 @@
 """
-Evaluate the trained depth decoder on the held-out KITTI test sequences
-(SPLIT_V1.test_sequences, see data/splits.py).
+Evaluate the trained semantic decoder on the held-out KITTI test sequences.
 
-    PYTHONPATH=src python -m jepa_drive_wm.evals.depth_evaluator [--checkpoint ...]
+The evaluator uses dataset-level pooling: one 19 x 19 confusion matrix is
+accumulated over all labelled pixels in the evaluated frames, and the metrics
+are computed from those pooled counts. The same metrics are also reported for
+each held-out sequence.
 
-- load the best checkpoint (built with the bins/norm strategies it records)
-- metrics via DepthEvaluator, all from one streaming pass over the test frames:
-      AbsRel, RMSE, delta1 -- over all valid pixels, over non-sky pixels
-      (sky/ignore group excluded; sky pseudolabel depth is noise), and over
-      vehicle pixels only, the latter as a proxy for vehicle localisation
-      (both masks from the OneFormer semantics GT);
-      the same three scopes per test sequence (01 highway / 07 urban / 09 rural
-      behave very differently), and AbsRel / RMSE / delta1 binned by GT depth
-      range (non-sky scope) to show where the error lives
-- outputs in OUTPUTS_DIR/evals_depth:
-      metrics.json, metrics.md                       all numbers above
-      error_by_depth_range.png                       AbsRel + delta1 per GT depth bin
-      seqXX_frameNNNNNN.png (every --viz-every)      RGB | GT + prediction (linear
-          and log depth scales, shared colour bars) | absolute and relative
-          error maps on fixed scales
+Quantitative outputs in OUTPUTS_DIR/evals_semantics:
 
-The metric definitions live in DepthMetricAccumulator so the world-model
-evaluator can score decoded rollouts with exactly the same code.
+    metrics.json
+        Complete machine-readable results.
+
+    metrics.md
+        Thesis-facing tables containing the headline metrics, per-sequence
+        results, and per-class IoU with OneFormer pseudo-label support.
+
+Qualitative outputs:
+
+    semantic_decoder_examples.png
+        One representative frame per held-out sequence, read from top to
+        bottom: RGB image, OneFormer fine pseudo-labels, and semantics decoded
+        from the V-JEPA representation.
+
+    semantic_decoder_planning_examples.png
+        The equivalent comparison after grouping the 19 Cityscapes classes
+        into the coarser planning categories used by this project.
+
+    per_class_iou.png
+        Fine-class IoU with the OneFormer pseudo-label pixel share shown for
+        each class.
+
+    confusion_matrix.png
+        Row-normalised fine-class confusion matrix.
+
+By default, the representative frame for each sequence is the frame whose
+planning-group mIoU is closest to that sequence's median frame score. This is
+used only to select qualitative examples; all reported quantitative metrics
+remain dataset-level pooled metrics.
 """
+
+from __future__ import annotations
+
 import argparse
+import math
 from pathlib import Path
 
+import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import numpy as np
+import scipy.ndimage
 import torch
-from matplotlib.colors import LogNorm
 
-from jepa_drive_wm.data.data_interface_dense import KITTIDepthDataset
+from jepa_drive_wm.data.data_interface_dense import KITTISemanticDataset
 from jepa_drive_wm.data.splits import SPLIT_V1
 from jepa_drive_wm.evals.common import (
-    DEPTH_CHECKPOINT,
     DEVICE,
+    SEMANTICS_CHECKPOINT,
+    SEQUENTIAL_CMAP,
     SERIES,
     describe_checkpoint,
-    finish_figure,
-    load_depth_decoder,
+    load_semantic_decoder,
     markdown_table,
-    new_figure,
     style_axes,
     write_metrics_json,
 )
-from jepa_drive_wm.models.dense_decoders.depth_decoder import DepthDecoder
+from jepa_drive_wm.models.dense_decoders.semantic_decoder import SemanticDecoder
 from jepa_drive_wm.paths import OUTPUTS_DIR
-from jepa_drive_wm.train.train_depth import MAX_DEPTH, MIN_DEPTH, predict
-from jepa_drive_wm.viz.visualiser import CLASS_NAMES, CLASS_TO_GROUP, GROUP_NAMES, NUM_CLASSES
+from jepa_drive_wm.train.train_semantics import IGNORE_INDEX, NUM_CLASSES, predict
+from jepa_drive_wm.viz.visualiser import (
+    CLASS_NAMES,
+    CLASS_TO_GROUP,
+    GROUP_NAMES,
+    NUM_GROUPS,
+    class_colors,
+    group_colors,
+)
 
-FIGURES_DIR = OUTPUTS_DIR / "evals_depth"
+
+FIGURES_DIR = OUTPUTS_DIR / "evals_semantics"
 TEST_SEQUENCES = list(SPLIT_V1.test_sequences)
 
-DELTA1_THRESHOLD = 1.25  # delta1 = fraction of pixels with max(pred/gt, gt/pred) < 1.25
+# Planning-oriented binary class subsets. Traffic participants are all classes
+# in the project's "dynamic object" group.
+DRIVABLE_CLASSES = CLASS_TO_GROUP == GROUP_NAMES.index("drivable")
+TRAFFIC_PARTICIPANT_CLASSES = CLASS_TO_GROUP == GROUP_NAMES.index("dynamic object")
+SKY_GROUP = GROUP_NAMES.index("sky / ignore")
+SKY_CLASS = CLASS_NAMES.index("sky")
 
-# GT depth bins (metres) for the error-by-range breakdown. Non-sky scope; the
-# last edge is MAX_DEPTH so the bins tile the valid range exactly.
-RANGE_EDGES = (MIN_DEPTH, 2.0, 5.0, 10.0, 20.0, 40.0, MAX_DEPTH)
+# Class id -> is drivable. The table has 256 entries so OneFormer's ignored
+# value 255 maps safely to False.
+DRIVABLE_LUT = np.zeros(256, dtype=bool)
+DRIVABLE_LUT[:NUM_CLASSES] = DRIVABLE_CLASSES
 
-# Cityscapes vehicle classes, masked from the OneFormer semantics GT. Person and
-# rider are deliberately excluded: this is a vehicle-localisation proxy.
-VEHICLE_CLASS_NAMES = ("car", "truck", "bus", "train", "motorcycle", "bicycle")
+# LaTeX-like thesis typography without requiring a system LaTeX installation.
+# text.usetex remains False so the evaluator is portable across machines.
+matplotlib.rcParams.update(
+    {
+        "text.usetex": False,
+        "font.family": "serif",
+        "font.serif": [
+            "CMU Serif",
+            "Computer Modern Roman",
+            "STIX Two Text",
+            "STIXGeneral",
+            "DejaVu Serif",
+        ],
+        "mathtext.fontset": "cm",
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "xtick.labelsize": 8.5,
+        "ytick.labelsize": 8.5,
+        "legend.fontsize": 8,
+        "savefig.dpi": 300,
+    }
+)
 
-# Class id (0..18) -> is vehicle. Sized 256 so IGNORE_INDEX maps to background.
-VEHICLE_LUT = np.zeros(256, dtype=bool)
-for _name in VEHICLE_CLASS_NAMES:
-    VEHICLE_LUT[CLASS_NAMES.index(_name)] = True
 
-# Class id -> is sky/ignore (the coarse planning group), used to exclude sky
-# from the non-sky metrics and the error maps: FoundationStereo sky depth is
-# essentially noise and would otherwise dominate the error. Anything outside
-# 0..18 (255 = unlabeled) also counts as ignore.
-SKY_IGNORE_LUT = np.ones(256, dtype=bool)
-SKY_IGNORE_LUT[:NUM_CLASSES] = CLASS_TO_GROUP == GROUP_NAMES.index("sky / ignore")
-
-SCOPES = ("all", "non-sky", "vehicle")
+# ----------------------------------------------------------------------------- helpers
 
 
-def _valid_mask(target: np.ndarray) -> np.ndarray:
-    """Pixels where the pseudolabel is trustworthy and inside the depth range
-    (numpy twin of train_depth._valid_mask)."""
-    return np.isfinite(target) & (target > MIN_DEPTH) & (target < MAX_DEPTH)
+def _format_percent(fraction: float) -> str:
+    """Format small supports without incorrectly displaying them as 0%."""
+    if not math.isfinite(fraction):
+        return "n/a"
+    percentage = 100.0 * fraction
+    if percentage == 0:
+        return "0%"
+    if percentage < 0.01:
+        return "<0.01%"
+    if percentage < 0.1:
+        return f"{percentage:.2f}%"
+    return f"{percentage:.1f}%"
 
 
-class DepthMetricAccumulator:
+def _boundary_band(mask: np.ndarray, dilation: int) -> np.ndarray:
     """
-    Streaming depth metrics against FoundationStereo pseudolabels.
+    Inner band of a binary mask within ``dilation`` pixels of its contour.
 
-    update() is fed one frame at a time (GT depth, predicted depth, OneFormer
-    semantics for the masks) and keeps sufficient statistics (error sums +
-    pixel counts) for the three pixel scopes -- "all" valid pixels, "non-sky"
-    (sky/ignore group excluded) and "vehicle" (vehicle-localisation proxy) --
-    plus the same statistics per GT depth bin on the non-sky scope.
+    Padding first makes the image border count as part of the contour, matching
+    the convention used in the original evaluator.
+    """
+    padded = np.pad(mask, 1)
+    distance = scipy.ndimage.distance_transform_cdt(padded, metric="chessboard")
+    return mask & (distance[1:-1, 1:-1] <= dilation)
 
-    Convention: pixels are pooled over everything fed in (dataset-level, not
-    mean-of-frames -- note some benchmarks average per-image instead).
+
+def _normalise_colour(pixel: np.ndarray) -> tuple[float, float, float]:
+    """Convert one RGB colour returned by the visualiser to Matplotlib RGB."""
+    colour = np.asarray(pixel, dtype=np.float64).reshape(-1)[:3]
+    if colour.max(initial=0.0) > 1.0:
+        colour = colour / 255.0
+    return tuple(float(value) for value in colour)
+
+
+def _fine_colour_image(labels: np.ndarray) -> np.ndarray:
+    """Render fine labels, showing OneFormer-unlabelled pixels in neutral grey."""
+    labels = labels.astype(np.int64, copy=False)
+    labelled = (labels >= 0) & (labels < NUM_CLASSES)
+    safe = np.where(labelled, labels, 0).astype(np.uint8)
+    image = np.asarray(class_colors(safe)).copy()
+
+    if image.dtype.kind in "ui":
+        ignore_colour = np.array([150, 150, 150], dtype=image.dtype)
+    else:
+        ignore_colour = np.array([0.59, 0.59, 0.59], dtype=image.dtype)
+    image[~labelled] = ignore_colour
+    return image
+
+
+def _planning_colour_image(labels: np.ndarray) -> np.ndarray:
+    """Render the project's coarse planning groups from fine Cityscapes ids."""
+    labels = labels.astype(np.int64, copy=False)
+    labelled = (labels >= 0) & (labels < NUM_CLASSES)
+    # The project's final group is explicitly named sky / ignore, so unlabelled
+    # target pixels are mapped to the sky class for this qualitative view.
+    safe = np.where(labelled, labels, SKY_CLASS).astype(np.uint8)
+    return np.asarray(group_colors(safe))
+
+
+def _fine_legend_handles() -> list[Patch]:
+    handles = []
+    for class_id, name in enumerate(CLASS_NAMES):
+        sample = class_colors(np.array([[class_id]], dtype=np.uint8))[0, 0]
+        handles.append(Patch(facecolor=_normalise_colour(sample), edgecolor="none", label=name))
+    handles.append(Patch(facecolor=(0.59, 0.59, 0.59), edgecolor="none", label="unlabelled"))
+    return handles
+
+
+def _planning_legend_handles() -> list[Patch]:
+    handles = []
+    for group_id, name in enumerate(GROUP_NAMES):
+        members = np.flatnonzero(CLASS_TO_GROUP == group_id)
+        if members.size == 0:
+            continue
+        sample = group_colors(np.array([[members[0]]], dtype=np.uint8))[0, 0]
+        handles.append(Patch(facecolor=_normalise_colour(sample), edgecolor="none", label=name))
+    return handles
+
+
+# ----------------------------------------------------------------------------- metrics
+
+
+class SemanticMetricAccumulator:
+    """
+    Streaming semantic metrics against OneFormer pseudo-labels.
+
+    ``update`` receives one target and one prediction map at a time. It adds
+    their counts to one 19 x 19 confusion matrix. IoUs are calculated from the
+    pooled confusion matrix, not separately per frame. Classes absent from both
+    target and prediction have undefined IoU and are excluded from mIoU.
+
+    This public interface is intentionally retained because the world-model
+    evaluators import this class to evaluate decoded predicted latents.
     """
 
-    def __init__(self, range_edges: tuple[float, ...] = RANGE_EDGES) -> None:
-        self.range_edges = tuple(range_edges)
-        self._scope = {scope: self._empty() for scope in SCOPES}
-        self._range = [self._empty() for _ in range(len(self.range_edges) - 1)]
+    def __init__(self, boundary_dilation_ratio: float = 0.02, with_boundary: bool = True) -> None:
+        self.boundary_dilation_ratio = boundary_dilation_ratio
+        self.with_boundary = with_boundary
+        self.confusion = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
+        self.boundary_intersection = 0
+        self.boundary_union = 0
         self.frames = 0
 
-    @staticmethod
-    def _empty() -> dict:
-        return {"absrel_sum": 0.0, "squared_error_sum": 0.0, "delta1_hits": 0, "pixels": 0}
+    def update(self, gt: np.ndarray, pred: np.ndarray) -> None:
+        """Update from one frame; ``gt`` may contain ``IGNORE_INDEX``."""
+        gt = gt.astype(np.int64, copy=False)
+        pred = pred.astype(np.int64, copy=False)
+        labelled = gt != IGNORE_INDEX
 
-    @staticmethod
-    def _add(stats: dict, gt: np.ndarray, pred: np.ndarray) -> None:
-        ratio = np.maximum(pred / gt, gt / pred)  # gt > MIN_DEPTH and pred > 0 by construction
-        stats["absrel_sum"] += float((np.abs(pred - gt) / gt).sum())
-        stats["squared_error_sum"] += float(((pred - gt) ** 2).sum())
-        stats["delta1_hits"] += int((ratio < DELTA1_THRESHOLD).sum())
-        stats["pixels"] += int(gt.size)
+        # confusion[i, j] = target class i predicted as class j
+        self.confusion += np.bincount(
+            gt[labelled] * NUM_CLASSES + pred[labelled],
+            minlength=NUM_CLASSES**2,
+        ).reshape(NUM_CLASSES, NUM_CLASSES)
 
-    def update(self, gt: np.ndarray, pred: np.ndarray, semantics: np.ndarray) -> None:
-        """gt, pred: (H, W) metres; semantics: (H, W) Cityscapes ids (255 = unlabeled)."""
-        valid = _valid_mask(gt)
-        non_sky = valid & ~SKY_IGNORE_LUT[semantics]
-        vehicle = valid & VEHICLE_LUT[semantics]
-        for scope, mask in (("all", valid), ("non-sky", non_sky), ("vehicle", vehicle)):
-            self._add(self._scope[scope], gt[mask], pred[mask])
-
-        g, p = gt[non_sky], pred[non_sky]
-        # digitize with the interior edges: bin i holds edges[i] <= g < edges[i+1]
-        bins = np.digitize(g, self.range_edges[1:-1])
-        for i, stats in enumerate(self._range):
-            in_bin = bins == i
-            if in_bin.any():
-                self._add(stats, g[in_bin], p[in_bin])
+        if self.with_boundary:
+            dilation = max(1, round(self.boundary_dilation_ratio * math.hypot(*gt.shape)))
+            gt_band = _boundary_band(DRIVABLE_LUT[gt], dilation)
+            pred_band = _boundary_band(DRIVABLE_LUT[pred], dilation)
+            self.boundary_intersection += int((gt_band & pred_band & labelled).sum())
+            self.boundary_union += int(((gt_band | pred_band) & labelled).sum())
         self.frames += 1
 
     @staticmethod
-    def _metrics(stats: dict) -> dict[str, float]:
-        n = stats["pixels"]
-        if not n:
-            return {"absrel": float("nan"), "rmse": float("nan"), "d1": float("nan"), "pixels": 0}
+    def _iou_per_row(confusion: np.ndarray) -> np.ndarray:
+        true_positive = np.diag(confusion).astype(np.float64)
+        union = confusion.sum(axis=0) + confusion.sum(axis=1) - true_positive
+        result = np.full(confusion.shape[0], np.nan, dtype=np.float64)
+        np.divide(true_positive, union, out=result, where=union > 0)
+        return result
+
+    def per_class_iou(self) -> np.ndarray:
+        return self._iou_per_row(self.confusion)
+
+    def group_confusion(self) -> np.ndarray:
+        group_confusion = np.zeros((NUM_GROUPS, NUM_GROUPS), dtype=np.int64)
+        np.add.at(
+            group_confusion,
+            (CLASS_TO_GROUP[:, None], CLASS_TO_GROUP[None, :]),
+            self.confusion,
+        )
+        return group_confusion
+
+    def _binary_group_iou(self, group_classes: np.ndarray) -> float:
+        on = group_classes
+        true_positive = self.confusion[np.ix_(on, on)].sum()
+        false_negative = self.confusion[np.ix_(on, ~on)].sum()
+        false_positive = self.confusion[np.ix_(~on, on)].sum()
+        union = true_positive + false_negative + false_positive
+        return float(true_positive / union) if union else float("nan")
+
+    def class_iou(self, cityscapes_class: int | str) -> float:
+        if isinstance(cityscapes_class, str):
+            cityscapes_class = CLASS_NAMES.index(cityscapes_class)
+        return float(self.per_class_iou()[cityscapes_class])
+
+    def mean_iou(self) -> float:
+        return float(np.nanmean(self.per_class_iou()))
+
+    def pixel_accuracy(self) -> float:
+        total = self.confusion.sum()
+        return float(np.trace(self.confusion) / total) if total else float("nan")
+
+    def planning_group_miou(self) -> float:
+        """
+        Mean IoU over drivable, soft-drivable, static-obstacle and dynamic-
+        object groups. The sky / ignore group's own IoU is excluded, although
+        sky pixels can still create false positives for another group.
+        """
+        per_group = self._iou_per_row(self.group_confusion())
+        return float(np.nanmean(np.delete(per_group, SKY_GROUP)))
+
+    def drivable_iou(self) -> float:
+        return self._binary_group_iou(DRIVABLE_CLASSES)
+
+    def drivable_boundary_iou(self) -> float:
+        if not self.with_boundary or not self.boundary_union:
+            return float("nan")
+        return float(self.boundary_intersection / self.boundary_union)
+
+    def traffic_participant_iou(self) -> float:
+        return self._binary_group_iou(TRAFFIC_PARTICIPANT_CLASSES)
+
+    def summary(self) -> dict[str, float | int]:
         return {
-            "absrel": stats["absrel_sum"] / n,
-            "rmse": float(np.sqrt(stats["squared_error_sum"] / n)),
-            "d1": stats["delta1_hits"] / n,
-            "pixels": n,
+            "miou": self.mean_iou(),
+            "pixel_accuracy": self.pixel_accuracy(),
+            "planning_group_miou": self.planning_group_miou(),
+            "drivable_iou": self.drivable_iou(),
+            "drivable_boundary_iou": self.drivable_boundary_iou(),
+            "traffic_participant_iou": self.traffic_participant_iou(),
+            "car_iou": self.class_iou("car"),
+            "labeled_pixels": int(self.confusion.sum()),
         }
-
-    def metrics(self, scope: str = "all") -> dict[str, float]:
-        """{'absrel', 'rmse', 'd1', 'pixels'} for one scope."""
-        return self._metrics(self._scope[scope])
-
-    def summary(self) -> dict[str, dict[str, float]]:
-        """All three scopes at once."""
-        return {scope: self.metrics(scope) for scope in SCOPES}
-
-    def range_table(self) -> list[dict]:
-        """Per GT depth bin (non-sky scope): the three metrics + the bin's pixel share."""
-        total = sum(s["pixels"] for s in self._range)
-        rows = []
-        for (lo, hi), stats in zip(zip(self.range_edges[:-1], self.range_edges[1:]), self._range):
-            row = {"lo": lo, "hi": hi, **self._metrics(stats)}
-            row["pixel_share"] = stats["pixels"] / total if total else float("nan")
-            rows.append(row)
-        return rows
 
 
 class ModelPredictions:
-    """
-    The trained decoder's metric depth maps over a dataset, indexable like a
-    list: predictions[i] is the (H, W) float32 depth in metres for dataset[i].
+    """Lazy, frame-aligned class predictions from the trained decoder."""
 
-    Lazy and uncached -- each access is one forward pass -- so a metrics pass
-    streams over ~4k frames instead of holding every full-resolution map in
-    memory, and DepthEvaluator stays decoupled from the model: it accepts
-    anything indexable that is frame-aligned with its test set.
-    """
-
-    def __init__(self, model: DepthDecoder, dataset: KITTIDepthDataset) -> None:
+    def __init__(self, model: SemanticDecoder, dataset: KITTISemanticDataset) -> None:
         self.model = model
         self.dataset = dataset
 
@@ -185,288 +329,645 @@ class ModelPredictions:
     @torch.no_grad()
     def __getitem__(self, item: int) -> np.ndarray:
         sample = self.dataset[item]
-        depth = predict(self.model, sample["features"][None].to(DEVICE), sample["target"].shape)
-        return depth.cpu().numpy()
+        logits = predict(self.model, sample["features"][None].to(DEVICE), sample["target"].shape)
+        return logits.argmax(dim=1)[0].to(torch.uint8).cpu().numpy()
 
 
-class DepthEvaluator:
-    """
-    Given the test set and frame-aligned predictions of it (from the trained
-    model), compute depth metrics against the FoundationStereo pseudolabels and
-    qualitative figures.
+class SemanticsEvaluator:
+    """Compute dataset-level metrics and thesis-ready semantic figures."""
 
-    One streaming pass over the test set (run lazily on the first metric call
-    and cached) feeds a dataset-level DepthMetricAccumulator and one per
-    sequence. `max_frames` caps the pass for smoke tests.
-    """
-
-    def __init__(self, test_set: KITTIDepthDataset, predicted_test_set,
-                 figures_dir: Path = FIGURES_DIR, max_frames: int | None = None) -> None:
+    def __init__(
+        self,
+        test_set: KITTISemanticDataset,
+        predicted_test_set,
+        boundary_dilation_ratio: float = 0.02,
+        figures_dir: Path = FIGURES_DIR,
+        max_frames: int | None = None,
+    ) -> None:
         self.test_set = test_set
         self.predictions = predicted_test_set
+        self.boundary_dilation_ratio = boundary_dilation_ratio
         self.figures_dir = figures_dir
         self.max_frames = max_frames
-        self._overall: DepthMetricAccumulator | None = None
-        self._per_sequence: dict[int, DepthMetricAccumulator] = {}
-
-    # ------------------------------------------------------------------ accumulation
+        self._overall: SemanticMetricAccumulator | None = None
+        self._per_sequence: dict[int, SemanticMetricAccumulator] = {}
+        self._frame_records: list[dict] = []
 
     def _items(self) -> list[int]:
-        n = len(self.test_set) if self.max_frames is None else min(self.max_frames, len(self.test_set))
-        return list(range(n))
+        count = len(self.test_set) if self.max_frames is None else min(self.max_frames, len(self.test_set))
+        return list(range(count))
 
-    def _accumulate(self) -> DepthMetricAccumulator:
-        """One pass over the test set: error sums and pixel counts per scope."""
+    def _accumulate(self) -> SemanticMetricAccumulator:
+        """One streaming pass over the evaluated frames."""
         if self._overall is not None:
             return self._overall
 
-        overall = DepthMetricAccumulator()
-        per_sequence: dict[int, DepthMetricAccumulator] = {}
+        overall = SemanticMetricAccumulator(self.boundary_dilation_ratio)
+        per_sequence: dict[int, SemanticMetricAccumulator] = {}
+        frame_records: list[dict] = []
+
         for item in self._items():
             sequence_nr, frame_index = self.test_set.index[item]
-            sequence = self.test_set.sequences[sequence_nr]
-            gt = sequence.get_depth(frame_index)          # (H, W) metres
-            pred = self.predictions[item]                 # (H, W) metres
-            semantics = sequence.get_semantics(frame_index)
-            overall.update(gt, pred, semantics)
-            per_sequence.setdefault(sequence_nr, DepthMetricAccumulator()).update(gt, pred, semantics)
+            gt = self.test_set.sequences[sequence_nr].get_semantics(frame_index)
+            pred = self.predictions[item]
 
-        self._overall, self._per_sequence = overall, per_sequence
+            overall.update(gt, pred)
+            per_sequence.setdefault(
+                sequence_nr,
+                SemanticMetricAccumulator(self.boundary_dilation_ratio),
+            ).update(gt, pred)
+
+            # Frame-level scores are stored only for reproducible qualitative
+            # example selection. They are not used for the headline metrics.
+            frame_accumulator = SemanticMetricAccumulator(with_boundary=False)
+            frame_accumulator.update(gt, pred)
+            frame_summary = frame_accumulator.summary()
+            frame_records.append(
+                {
+                    "item": int(item),
+                    "sequence": int(sequence_nr),
+                    "frame": int(frame_index),
+                    "miou": float(frame_summary["miou"]),
+                    "planning_group_miou": float(frame_summary["planning_group_miou"]),
+                }
+            )
+
+        self._overall = overall
+        self._per_sequence = per_sequence
+        self._frame_records = frame_records
         return overall
 
-    # ------------------------------------------------------------------ metrics
+    # ---------------------------------------------------------------- metrics
 
-    def calculate_absrel(self) -> float:
-        """Mean |pred - gt| / gt over all valid pixels."""
-        return self._accumulate().metrics("all")["absrel"]
+    def get_IOU(self, cityscapes_class: int | str) -> float:
+        return self._accumulate().class_iou(cityscapes_class)
 
-    def calculate_rmse(self) -> float:
-        """Root mean squared error in metres over all valid pixels."""
-        return self._accumulate().metrics("all")["rmse"]
+    def calculate_mean_IOU(self) -> float:
+        return self._accumulate().mean_iou()
 
-    def calculate_d1(self) -> float:
-        """Threshold accuracy: fraction of valid pixels with max(pred/gt, gt/pred) < 1.25."""
-        return self._accumulate().metrics("all")["d1"]
+    def calculate_pixel_accuracy(self) -> float:
+        return self._accumulate().pixel_accuracy()
 
-    def calculate_non_sky_depth_error(self) -> dict[str, float]:
-        """
-        AbsRel / RMSE / delta1 excluding the sky/ignore planning group (sky
-        class + unlabeled). FoundationStereo sky depth is essentially noise, so
-        this scope is the honest summary of geometry the decoder should get right.
-        """
-        return self._accumulate().metrics("non-sky")
+    def calculate_planning_group_mIOU(self) -> float:
+        return self._accumulate().planning_group_miou()
 
-    def calculate_vehicle_pixel_depth_error(self) -> dict[str, float]:
-        """
-        AbsRel / RMSE / delta1 restricted to vehicle pixels (VEHICLE_CLASS_NAMES
-        in the OneFormer semantics GT). Depth on vehicles is what turns "there
-        is a car" into "there is a car 12 m ahead", so this is the
-        vehicle-localisation proxy.
-        """
-        return self._accumulate().metrics("vehicle")
+    def calculate_drivable_IOU(self) -> float:
+        return self._accumulate().drivable_iou()
 
-    def per_sequence_metrics(self) -> dict[int, dict[str, dict[str, float]]]:
-        """{sequence_nr: {scope: {absrel, rmse, d1, pixels}}}."""
+    def calculate_drivable_boundary_IOU(self) -> float:
+        return self._accumulate().drivable_boundary_iou()
+
+    def calculate_traffic_participant_IOU(self) -> float:
+        return self._accumulate().traffic_participant_iou()
+
+    def per_sequence_metrics(self) -> dict[int, dict[str, float | int]]:
         self._accumulate()
-        return {seq: acc.summary() for seq, acc in sorted(self._per_sequence.items())}
-
-    def error_by_depth_range(self) -> list[dict]:
-        """Non-sky AbsRel / RMSE / delta1 per GT depth bin (RANGE_EDGES)."""
-        return self._accumulate().range_table()
-
-    def all_metrics(self) -> dict:
-        """Everything, ready for metrics.json."""
-        overall = self._accumulate()
         return {
-            "frames": overall.frames,
-            "overall": overall.summary(),
-            "per_sequence": {f"{seq:02d}": m for seq, m in self.per_sequence_metrics().items()},
-            "by_depth_range": self.error_by_depth_range(),
+            sequence: accumulator.summary()
+            for sequence, accumulator in sorted(self._per_sequence.items())
         }
 
-    # ------------------------------------------------------------------ qualitative
+    def all_metrics(self) -> dict:
+        overall = self._accumulate()
+        per_class = overall.per_class_iou()
+        class_pixels = overall.confusion.sum(axis=1)
+        total_pixels = max(int(class_pixels.sum()), 1)
+        class_share = class_pixels / total_pixels
 
-    def plot_error_by_depth_range(self, path: Path | None = None) -> Path:
-        """Two panels: AbsRel and delta1 per GT depth bin (non-sky), pixel share as bar labels."""
-        rows = self.error_by_depth_range()
-        labels = [f"{r['lo']:g}-{r['hi']:g} m" for r in rows]
-        x = np.arange(len(rows))
-        fig, axes = new_figure(ncols=2, width=6.0, height=4.0)
-        for ax, key, title in zip(axes[0], ("absrel", "d1"),
-                                  ("AbsRel by GT depth (non-sky)", "delta1 by GT depth (non-sky)")):
-            values = [r[key] for r in rows]
-            ax.bar(x, values, width=0.7, color=SERIES[0], linewidth=0)
-            for xi, value, row in zip(x, values, rows):
-                if np.isfinite(value):
-                    ax.text(xi, value, f"{value:.3f}\n({row['pixel_share']:.0%} px)",
-                            ha="center", va="bottom", fontsize=7.5, color="#52514e")
-            ax.set_xticks(x, labels, rotation=0, fontsize=8)
-            style_axes(ax, title=title, ylabel=key)
-            if key == "d1":
-                ax.set_ylim(0, 1.05)
-        path = path or self.figures_dir / "error_by_depth_range.png"
-        finish_figure(fig, path)
+        return {
+            "frames": overall.frames,
+            "aggregation": "dataset-level confusion matrix pooled over all labelled pixels",
+            "test_sequences": TEST_SEQUENCES,
+            "overall": overall.summary(),
+            "per_class_iou": {
+                name: float(iou) for name, iou in zip(CLASS_NAMES, per_class)
+            },
+            "per_class_pseudolabel_pixels": {
+                name: int(pixels) for name, pixels in zip(CLASS_NAMES, class_pixels)
+            },
+            "per_class_pseudolabel_pixel_share": {
+                name: float(share) for name, share in zip(CLASS_NAMES, class_share)
+            },
+            # Retain the old key for compatibility with any downstream notes.
+            "per_class_gt_pixel_share": {
+                name: float(share) for name, share in zip(CLASS_NAMES, class_share)
+            },
+            "per_sequence": {
+                f"{sequence:02d}": values
+                for sequence, values in self.per_sequence_metrics().items()
+            },
+            "confusion": overall.confusion.tolist(),
+        }
+
+    # ------------------------------------------------------- example selection
+
+    def select_example_records(self, selection: str = "median") -> list[dict]:
+        """
+        Select one reproducible example per held-out sequence.
+
+        median: frame nearest the sequence median planning-group mIoU
+        worst:  frame with the lowest planning-group mIoU
+        middle: temporal middle frame among the evaluated frames
+        """
+        if selection not in {"median", "worst", "middle"}:
+            raise ValueError(f"unknown example selection: {selection!r}")
+
+        self._accumulate()
+        selected: list[dict] = []
+        for sequence in TEST_SEQUENCES:
+            records = [
+                record
+                for record in self._frame_records
+                if record["sequence"] == sequence
+                and math.isfinite(record["planning_group_miou"])
+            ]
+            if not records:
+                continue
+
+            if selection == "worst":
+                chosen = min(records, key=lambda record: record["planning_group_miou"])
+            elif selection == "middle":
+                chosen = records[len(records) // 2]
+            else:
+                median_score = float(
+                    np.median([record["planning_group_miou"] for record in records])
+                )
+                chosen = min(
+                    records,
+                    key=lambda record: abs(record["planning_group_miou"] - median_score),
+                )
+            selected.append(chosen)
+        return selected
+
+    # ---------------------------------------------------------------- figures
+
+    def plot_per_class_iou(self, path: Path | None = None) -> Path:
+        """Fine-class IoU with pseudo-label support shown beside each bar."""
+        overall = self._accumulate()
+        per_class = overall.per_class_iou()
+        class_pixels = overall.confusion.sum(axis=1)
+        share = class_pixels / max(int(class_pixels.sum()), 1)
+
+        y = np.arange(NUM_CLASSES)
+        values = np.nan_to_num(per_class, nan=0.0)
+
+        fig, ax = plt.subplots(figsize=(7.2, 6.5))
+        ax.barh(y, values, height=0.68, color=SERIES[0], linewidth=0)
+        ax.set_yticks(y, CLASS_NAMES)
+        ax.invert_yaxis()
+
+        for position, value, support, raw in zip(y, values, share, per_class):
+            if np.isnan(raw):
+                label = "absent"
+            else:
+                label = f"IoU {raw:.3f}; {_format_percent(float(support))} of pseudo-label pixels"
+            ax.text(value + 0.012, position, label, va="center", fontsize=7.5)
+
+        ax.set_xlim(0, 1.34)
+        style_axes(
+            ax,
+            xlabel="Intersection over union",
+        )
+        ax.xaxis.grid(True, alpha=0.65)
+        ax.yaxis.grid(False)
+
+        # Keep the title and explanatory subtitle in the figure margin rather
+        # than inside the axes so they cannot overlap each other.
+        fig.suptitle(
+            "Fine-class semantic decoding",
+            x=0.125,
+            y=0.985,
+            ha="left",
+            fontsize=11,
+        )
+        fig.text(
+            0.125,
+            0.955,
+            f"Dataset-level mIoU = {overall.mean_iou():.3f}; support from OneFormer pseudo-labels",
+            ha="left",
+            va="top",
+            fontsize=8.5,
+        )
+
+        path = path or self.figures_dir / "per_class_iou.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.tight_layout(rect=(0, 0, 1, 0.93))
+        fig.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
         return path
 
-    def visualise_depth(self, viz_every: int = 100) -> None:
-        """
-        Every `viz_every` frames, one PNG with 7 rows:
+    def plot_confusion_matrix(self, path: Path | None = None) -> Path:
+        """Row-normalised fine-class confusion matrix."""
+        confusion = self._accumulate().confusion.astype(np.float64)
+        row_sum = confusion.sum(axis=1, keepdims=True)
+        normalised = np.divide(
+            confusion,
+            row_sum,
+            out=np.zeros_like(confusion),
+            where=row_sum > 0,
+        )
 
-            RGB | GT + prediction on a linear depth scale | GT + prediction on a
-            log depth scale | absolute error | absolute relative error
-            (error maps exclude the sky/ignore group, whose pseudolabel depth
-            is noise that overwhelms the real signal)
+        fig, ax = plt.subplots(figsize=(8.7, 7.7))
+        image = ax.imshow(normalised, cmap=SEQUENTIAL_CMAP, vmin=0, vmax=1)
+        ax.set_xticks(range(NUM_CLASSES), CLASS_NAMES, rotation=90)
+        ax.set_yticks(range(NUM_CLASSES), CLASS_NAMES)
 
-        The log view expands the near range that the linear 0.5-80 m scale
-        compresses (where driving decisions live); GT and prediction share one
-        normalisation and colour bar per pair so colours are comparable. Error
-        maps use fixed scales (0-10 m, 0-0.5) so figures are comparable across
-        frames and checkpoints; invalid-GT pixels render white.
+        # Annotate only substantial confusions to keep a 19 x 19 matrix legible.
+        for row in range(NUM_CLASSES):
+            for column in range(NUM_CLASSES):
+                value = normalised[row, column]
+                if value >= 0.10:
+                    ax.text(
+                        column,
+                        row,
+                        f"{value:.2f}",
+                        ha="center",
+                        va="center",
+                        fontsize=6,
+                        color="white" if value > 0.58 else "black",
+                    )
+
+        ax.set_title("Fine-class confusion", loc="left", pad=10)
+        ax.set_xlabel("Decoded class")
+        ax.set_ylabel("OneFormer pseudo-label")
+        colour_bar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025)
+        colour_bar.set_label("Fraction of each pseudo-label class")
+
+        path = path or self.figures_dir / "confusion_matrix.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+    def _plot_example_grid(
+        self,
+        *,
+        planning: bool,
+        selection: str,
+        path: Path,
+    ) -> Path:
+        records = self.select_example_records(selection)
+        if not records:
+            raise RuntimeError("No semantic frames were available for visualisation")
+
+        columns = len(records)
+        figure_height = 5.7 if planning else 6.2
+        fig, axes = plt.subplots(
+            3,
+            columns,
+            figsize=(4.15 * columns, figure_height),
+            squeeze=False,
+        )
+
+        for column, record in enumerate(records):
+            item = int(record["item"])
+            sequence_nr = int(record["sequence"])
+            frame_index = int(record["frame"])
+            sequence = self.test_set.sequences[sequence_nr]
+
+            rgb = sequence.get_image(frame_index)
+            target = sequence.get_semantics(frame_index)
+            prediction = self.predictions[item]
+
+            if planning:
+                target_image = _planning_colour_image(target)
+                prediction_image = _planning_colour_image(prediction)
+                score_name = "planning mIoU"
+                score = record["planning_group_miou"]
+            else:
+                target_image = _fine_colour_image(target)
+                prediction_image = _fine_colour_image(prediction)
+                score_name = "frame mIoU"
+                score = record["miou"]
+
+            axes[0, column].imshow(rgb)
+            axes[1, column].imshow(target_image)
+            axes[2, column].imshow(prediction_image)
+            axes[0, column].set_title(
+                f"Sequence {sequence_nr:02d}, frame {frame_index}\n"
+                f"{score_name} = {score:.3f}",
+                pad=7,
+            )
+
+            for row in range(3):
+                axes[row, column].set_xticks([])
+                axes[row, column].set_yticks([])
+                for spine in axes[row, column].spines.values():
+                    spine.set_visible(False)
+
+        if planning:
+            row_labels = (
+                "RGB image",
+                "OneFormer\nplanning groups",
+                "Decoded\nplanning groups",
+            )
+            handles = _planning_legend_handles()
+            legend_columns = min(len(handles), 5)
+            bottom = 0.12
+        else:
+            row_labels = (
+                "RGB image",
+                "OneFormer\npseudo-labels",
+                "Decoded V-JEPA\nsemantics",
+            )
+            handles = _fine_legend_handles()
+            legend_columns = 7
+            bottom = 0.20
+
+        for row, label in enumerate(row_labels):
+            axes[row, 0].set_ylabel(
+                label,
+                rotation=90,
+                va="center",
+                labelpad=18,
+                fontsize=10,
+            )
+
+        fig.legend(
+            handles=handles,
+            loc="lower center",
+            ncol=legend_columns,
+            frameon=False,
+            bbox_to_anchor=(0.5, 0.01),
+            columnspacing=0.9,
+            handlelength=1.1,
+            handletextpad=0.35,
+        )
+        fig.subplots_adjust(
+            left=0.09,
+            right=0.995,
+            top=0.91,
+            bottom=bottom,
+            wspace=0.025,
+            hspace=0.08,
+        )
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        return path
+
+    def plot_thesis_examples(self, selection: str = "median") -> tuple[Path, Path]:
+        """Generate fine-class and planning-group qualitative figures."""
+        fine_path = self.figures_dir / "semantic_decoder_examples.png"
+        planning_path = self.figures_dir / "semantic_decoder_planning_examples.png"
+        self._plot_example_grid(
+            planning=False,
+            selection=selection,
+            path=fine_path,
+        )
+        self._plot_example_grid(
+            planning=True,
+            selection=selection,
+            path=planning_path,
+        )
+        return fine_path, planning_path
+
+    def visualise_semantic_segmentation(self, viz_every: int) -> None:
         """
+        Optional legacy diagnostic output: one four-panel image every N frames.
+
+        This is disabled by default because the two compact thesis figures are
+        usually more useful than hundreds of per-frame files.
+        """
+        if viz_every <= 0:
+            return
         self.figures_dir.mkdir(parents=True, exist_ok=True)
         for item in self._items()[::viz_every]:
             sequence_nr, frame_index = self.test_set.index[item]
             sequence = self.test_set.sequences[sequence_nr]
-            gt = sequence.get_depth(frame_index)
-            pred = self.predictions[item]
+            target = sequence.get_semantics(frame_index)
+            prediction = self.predictions[item]
 
-            valid = _valid_mask(gt)
-            gt_display = np.where(valid, gt, np.nan)
-            # Sky depth is pseudolabel noise and would overwhelm the error maps.
-            error_scope = valid & ~SKY_IGNORE_LUT[sequence.get_semantics(frame_index)]
-            absolute_error = np.where(error_scope, np.abs(pred - gt), np.nan)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                relative_error = np.where(error_scope, np.abs(pred - gt) / gt, np.nan)
-
-            fig = plt.figure(figsize=(11, 20), constrained_layout=True)
-            grid = fig.add_gridspec(7, 2, width_ratios=[1, 0.025])
-            axes = [fig.add_subplot(grid[row, 0]) for row in range(7)]
-            rgb_ax, gt_linear_ax, pred_linear_ax, gt_log_ax, pred_log_ax, abs_ax, rel_ax = axes
-
-            rgb_ax.imshow(sequence.get_image(frame_index))
-            rgb_ax.set_title(f"seq {sequence_nr:02d} frame {frame_index}")
-
-            linear = {"cmap": "plasma", "vmin": MIN_DEPTH, "vmax": MAX_DEPTH}
-            image = gt_linear_ax.imshow(gt_display, **linear)
-            gt_linear_ax.set_title("FoundationStereo depth (linear)")
-            pred_linear_ax.imshow(pred, **linear)
-            pred_linear_ax.set_title("predicted depth (linear)")
-            fig.colorbar(image, cax=fig.add_subplot(grid[1:3, 1]), label="Depth (m)")
-
-            log_norm = LogNorm(vmin=MIN_DEPTH, vmax=MAX_DEPTH)
-            image = gt_log_ax.imshow(gt_display, cmap="plasma", norm=log_norm)
-            gt_log_ax.set_title("FoundationStereo depth (log)")
-            pred_log_ax.imshow(pred, cmap="plasma", norm=log_norm)
-            pred_log_ax.set_title("predicted depth (log)")
-            colorbar = fig.colorbar(image, cax=fig.add_subplot(grid[3:5, 1]), label="Depth (m)")
-            colorbar.set_ticks([1, 2, 5, 10, 20, 40, 80],
-                               labels=["1", "2", "5", "10", "20", "40", "80"])
-
-            image = abs_ax.imshow(absolute_error, cmap="inferno", vmin=0, vmax=10)
-            abs_ax.set_title("absolute error (non-sky)")
-            fig.colorbar(image, cax=fig.add_subplot(grid[5, 1]), extend="max",
-                         label="|pred - gt| (m)")
-
-            image = rel_ax.imshow(relative_error, cmap="inferno", vmin=0, vmax=0.5)
-            rel_ax.set_title("absolute relative error (non-sky)")
-            fig.colorbar(image, cax=fig.add_subplot(grid[6, 1]), extend="max",
-                         label="|pred - gt| / gt")
-
-            for ax in axes:
+            panels = [
+                (sequence.get_image(frame_index), "RGB image"),
+                (_fine_colour_image(target), "OneFormer pseudo-labels"),
+                (_fine_colour_image(prediction), "Decoded fine semantics"),
+                (_planning_colour_image(prediction), "Decoded planning groups"),
+            ]
+            fig, axes = plt.subplots(4, 1, figsize=(10, 10))
+            for ax, (panel, title) in zip(axes, panels):
+                ax.imshow(panel)
+                ax.set_title(title)
                 ax.axis("off")
-            fig.savefig(self.figures_dir / f"seq{sequence_nr:02d}_frame{frame_index:06d}.png", dpi=150)
+            fig.suptitle(f"Sequence {sequence_nr:02d}, frame {frame_index}")
+            fig.tight_layout()
+            fig.savefig(
+                self.figures_dir / f"seq{sequence_nr:02d}_frame{frame_index:06d}.png",
+                dpi=200,
+                bbox_inches="tight",
+            )
             plt.close(fig)
 
 
 # ----------------------------------------------------------------------------- reporting
 
+
+HEADLINE = [
+    ("miou", "Fine-class mIoU"),
+    ("planning_group_miou", "Planning-group mIoU (excluding sky)"),
+    ("drivable_iou", "Drivable IoU"),
+    ("drivable_boundary_iou", "Drivable boundary IoU"),
+    ("traffic_participant_iou", "Traffic-participant IoU"),
+    ("car_iou", "Car IoU"),
+    ("pixel_accuracy", "Pixel accuracy (supporting)"),
+]
+
+
 def metrics_markdown(metrics: dict, checkpoint_line: str) -> str:
-    """metrics.md: the console overview as tables."""
+    """Create the thesis-facing Markdown report."""
     overall = metrics["overall"]
-    scope_rows = [[scope, m["absrel"], m["rmse"], m["d1"], m["pixels"]]
-                  for scope, m in overall.items()]
-    seq_rows = [[seq, m["non-sky"]["absrel"], m["non-sky"]["rmse"], m["non-sky"]["d1"],
-                 m["vehicle"]["absrel"], m["vehicle"]["d1"], m["all"]["absrel"]]
-                for seq, m in metrics["per_sequence"].items()]
-    range_rows = [[f"{r['lo']:g}-{r['hi']:g} m", r["absrel"], r["rmse"], r["d1"],
-                   r["pixel_share"]] for r in metrics["by_depth_range"]]
-    return "\n".join([
-        "# Depth decoder -- test set (SPLIT_V1: sequences "
-        + ", ".join(f"{s:02d}" for s in TEST_SEQUENCES) + ")",
-        "",
-        f"checkpoint: `{checkpoint_line}`  ",
-        f"frames: {metrics['frames']}; pixels pooled over the test set (dataset-level, not mean-of-frames)",
-        "",
-        "## Overall",
-        "",
-        markdown_table(["scope", "AbsRel", "RMSE (m)", "delta1", "pixels"], scope_rows),
-        "",
-        "scopes: all valid pixels (" + f"{MIN_DEPTH:g} < gt < {MAX_DEPTH:g} m); non-sky = sky/ignore "
-        "group excluded; vehicle = " + ", ".join(VEHICLE_CLASS_NAMES),
-        "",
-        "## Per sequence",
-        "",
-        markdown_table(["seq", "non-sky AbsRel", "non-sky RMSE (m)", "non-sky delta1",
-                        "vehicle AbsRel", "vehicle delta1", "all AbsRel"], seq_rows),
-        "",
-        "## By GT depth range (non-sky)",
-        "",
-        markdown_table(["GT depth", "AbsRel", "RMSE (m)", "delta1", "pixel share"], range_rows),
-        "",
-    ])
+    headline_rows = [[label, overall[key]] for key, label in HEADLINE]
+
+    class_rows = [
+        [
+            name,
+            metrics["per_class_iou"][name],
+            _format_percent(metrics["per_class_pseudolabel_pixel_share"][name]),
+            metrics["per_class_pseudolabel_pixels"][name],
+        ]
+        for name in CLASS_NAMES
+    ]
+
+    sequence_rows = [
+        [
+            sequence,
+            values["miou"],
+            values["planning_group_miou"],
+            values["drivable_iou"],
+            values["drivable_boundary_iou"],
+            values["traffic_participant_iou"],
+            values["car_iou"],
+            values["pixel_accuracy"],
+        ]
+        for sequence, values in metrics["per_sequence"].items()
+    ]
+
+    return "\n".join(
+        [
+            "# Semantic decoder -- held-out test set",
+            "",
+            "test sequences: " + ", ".join(f"{sequence:02d}" for sequence in TEST_SEQUENCES) + "  ",
+            f"checkpoint: `{checkpoint_line}`  ",
+            f"frames: {metrics['frames']}; labelled pixels: {overall['labeled_pixels']:,}  ",
+            "aggregation: one confusion matrix pooled over all labelled pixels in the evaluated frames",
+            "",
+            "## Headline results",
+            "",
+            markdown_table(["metric", "value"], headline_rows),
+            "",
+            "Fine-class mIoU gives every Cityscapes class equal weight after dataset-level pooling; "
+            "classes absent from both the OneFormer pseudo-labels and the decoder predictions are excluded. "
+            "Planning-group mIoU averages drivable, soft-drivable, static-obstacle and dynamic-object IoU; "
+            "the sky group's own IoU is excluded. Pixel accuracy is retained as a supporting metric because "
+            "large common classes contribute most of its pixels.",
+            "",
+            "## Results by sequence",
+            "",
+            markdown_table(
+                [
+                    "sequence",
+                    "mIoU",
+                    "planning mIoU",
+                    "drivable IoU",
+                    "drivable bIoU",
+                    "traffic IoU",
+                    "car IoU",
+                    "pixel accuracy",
+                ],
+                sequence_rows,
+            ),
+            "",
+            "## Fine-class results",
+            "",
+            markdown_table(
+                ["class", "IoU", "pseudo-label pixel share", "pseudo-label pixels"],
+                class_rows,
+            ),
+            "",
+            "Traffic-participant IoU combines person, rider, car, truck, bus, train, motorcycle and bicycle "
+            "into one foreground region. Confusions within that group therefore count as spatially correct for "
+            "this metric, while car IoU still requires the specific car class.",
+            "",
+        ]
+    )
+
+
+def print_overview(metrics: dict) -> None:
+    overall = metrics["overall"]
+    print("\nHeadline semantic-decoder results")
+    print(f"{'metric':<40} {'value':>10}")
+    for key, label in HEADLINE:
+        print(f"{label:<40} {overall[key]:>10.4f}")
+
+    print("\nPer-sequence results")
+    print(
+        f"{'seq':<6} {'mIoU':>8} {'plan mIoU':>11} {'drive IoU':>11} "
+        f"{'drive bIoU':>12} {'traffic':>10} {'car':>8}"
+    )
+    for sequence, values in metrics["per_sequence"].items():
+        print(
+            f"{sequence:<6} {values['miou']:>8.4f} {values['planning_group_miou']:>11.4f} "
+            f"{values['drivable_iou']:>11.4f} {values['drivable_boundary_iou']:>12.4f} "
+            f"{values['traffic_participant_iou']:>10.4f} {values['car_iou']:>8.4f}"
+        )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate the trained depth decoder on the test split")
-    parser.add_argument("--checkpoint", type=Path, default=DEPTH_CHECKPOINT)
-    parser.add_argument("--viz-every", type=int, default=100,
-                        help="save a figure every N test frames (0 disables)")
-    parser.add_argument("--max-frames", type=int, default=None,
-                        help="only score the first N test frames (smoke tests)")
+    parser = argparse.ArgumentParser(description="Evaluate the trained semantic decoder")
+    parser.add_argument("--checkpoint", type=Path, default=SEMANTICS_CHECKPOINT)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="score only the first N test frames (for smoke tests)",
+    )
     parser.add_argument("--figures-dir", type=Path, default=FIGURES_DIR)
+    parser.add_argument(
+        "--example-selection",
+        choices=("median", "worst", "middle"),
+        default="median",
+        help="select median-performance, worst, or temporal-middle examples per sequence",
+    )
+    parser.add_argument(
+        "--skip-examples",
+        action="store_true",
+        help="do not generate the two thesis qualitative figures",
+    )
+    parser.add_argument(
+        "--skip-confusion",
+        action="store_true",
+        help="do not generate the confusion-matrix figure",
+    )
+    parser.add_argument(
+        "--skip-per-class-plot",
+        action="store_true",
+        help="do not generate the per-class IoU figure",
+    )
+    parser.add_argument(
+        "--viz-every",
+        type=int,
+        default=0,
+        help="optional legacy diagnostics: save one per-frame figure every N frames; 0 disables",
+    )
     args = parser.parse_args()
 
-    model, checkpoint = load_depth_decoder(args.checkpoint)
+    model, checkpoint = load_semantic_decoder(args.checkpoint)
     checkpoint_line = describe_checkpoint(args.checkpoint, checkpoint)
     print(f"loaded {checkpoint_line}")
 
-    dataset = KITTIDepthDataset(TEST_SEQUENCES)
-    evaluator = DepthEvaluator(dataset, ModelPredictions(model, dataset),
-                               figures_dir=args.figures_dir, max_frames=args.max_frames)
-
-    print(f"\nAbsRel        {evaluator.calculate_absrel():.4f}")
-    print(f"RMSE          {evaluator.calculate_rmse():.4f} m")
-    print(f"delta1        {evaluator.calculate_d1():.4f}")
-    non_sky = evaluator.calculate_non_sky_depth_error()
-    print("\nnon-sky pixels only (sky/ignore group excluded):")
-    print(f"AbsRel        {non_sky['absrel']:.4f}")
-    print(f"RMSE          {non_sky['rmse']:.4f} m")
-    print(f"delta1        {non_sky['d1']:.4f}")
-    vehicle = evaluator.calculate_vehicle_pixel_depth_error()
-    print("\nvehicle pixels only (" + ", ".join(VEHICLE_CLASS_NAMES) + "):")
-    print(f"AbsRel        {vehicle['absrel']:.4f}")
-    print(f"RMSE          {vehicle['rmse']:.4f} m")
-    print(f"delta1        {vehicle['d1']:.4f}")
+    dataset = KITTISemanticDataset(TEST_SEQUENCES)
+    evaluator = SemanticsEvaluator(
+        dataset,
+        ModelPredictions(model, dataset),
+        figures_dir=args.figures_dir,
+        max_frames=args.max_frames,
+    )
 
     metrics = evaluator.all_metrics()
     metrics["checkpoint"] = checkpoint_line
-    metrics["test_sequences"] = TEST_SEQUENCES
-    print("\nper sequence (non-sky AbsRel / delta1):")
-    for seq, m in metrics["per_sequence"].items():
-        print(f"  seq {seq}: AbsRel {m['non-sky']['absrel']:.4f}  delta1 {m['non-sky']['d1']:.4f}  "
-              f"({m['non-sky']['pixels'] / 1e6:.1f}M px)")
-    print("\nby GT depth range (non-sky):")
-    for r in metrics["by_depth_range"]:
-        print(f"  {r['lo']:>4g}-{r['hi']:<4g} m: AbsRel {r['absrel']:.4f}  RMSE {r['rmse']:.3f} m  "
-              f"delta1 {r['d1']:.4f}  ({r['pixel_share']:.1%} of px)")
+
+    example_records = evaluator.select_example_records(args.example_selection)
+    metrics["qualitative_examples"] = {
+        "selection": args.example_selection,
+        "selection_metric": "per-frame planning-group mIoU",
+        "frames": [
+            {
+                "sequence": record["sequence"],
+                "frame": record["frame"],
+                "frame_miou": record["miou"],
+                "frame_planning_group_miou": record["planning_group_miou"],
+            }
+            for record in example_records
+        ],
+    }
+
+    print_overview(metrics)
 
     args.figures_dir.mkdir(parents=True, exist_ok=True)
-    write_metrics_json(metrics, args.figures_dir / "metrics.json")
-    (args.figures_dir / "metrics.md").write_text(metrics_markdown(metrics, checkpoint_line))
-    evaluator.plot_error_by_depth_range()
-    if args.viz_every:
-        evaluator.visualise_depth(args.viz_every)
-    print(f"\nmetrics + figures saved to {args.figures_dir}")
+    metrics_path = args.figures_dir / "metrics.json"
+    report_path = args.figures_dir / "metrics.md"
+    write_metrics_json(metrics, metrics_path)
+    report_path.write_text(metrics_markdown(metrics, checkpoint_line))
+
+    print(f"\nmetrics: {metrics_path}")
+    print(f"report:  {report_path}")
+
+    if not args.skip_per_class_plot:
+        path = evaluator.plot_per_class_iou()
+        print(f"per-class figure: {path}")
+
+    if not args.skip_confusion:
+        path = evaluator.plot_confusion_matrix()
+        print(f"confusion figure: {path}")
+
+    if not args.skip_examples:
+        fine_path, planning_path = evaluator.plot_thesis_examples(args.example_selection)
+        print(f"fine qualitative figure:     {fine_path}")
+        print(f"planning qualitative figure: {planning_path}")
+
+    evaluator.visualise_semantic_segmentation(args.viz_every)
 
 
 if __name__ == "__main__":
