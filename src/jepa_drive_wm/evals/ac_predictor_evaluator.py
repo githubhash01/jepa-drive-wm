@@ -82,6 +82,7 @@ from jepa_drive_wm.evals.common import (
     SERIES,
     WM_CHECKPOINT_DIR,
     describe_checkpoint,
+    fmt,
     load_depth_decoder,
     load_semantic_decoder,
     load_world_model,
@@ -121,6 +122,9 @@ from jepa_drive_wm.viz.visualiser import (
 
 
 FIGURES_DIR = OUTPUTS_DIR / "evals_wm"
+# The trainer writes to checkpoints_wm, but on this machine the trained
+# action-conditioned models live in checkpoints_ac.
+AC_CHECKPOINT_DIR = OUTPUTS_DIR / "checkpoints_ac"
 TEST_SEQUENCES = list(SPLIT_V1.test_sequences)
 FRAME_PERIOD = KITTIRolloutDataset.FRAME_PERIOD
 
@@ -182,8 +186,17 @@ matplotlib.rcParams.update(
 
 
 def default_checkpoints() -> list[Path]:
-    """Return every standard timestep-tagged action-conditioned checkpoint."""
-    return sorted(WM_CHECKPOINT_DIR.glob("world_model_dt*.pt"))
+    """Return every standard timestep-tagged action-conditioned checkpoint.
+
+    The trainer writes to WM_CHECKPOINT_DIR (checkpoints_wm), but the trained
+    models may live in checkpoints_ac instead; the first directory that
+    contains world_model_dt*.pt wins.
+    """
+    for directory in (WM_CHECKPOINT_DIR, AC_CHECKPOINT_DIR):
+        found = sorted(directory.glob("world_model_dt*.pt"))
+        if found:
+            return found
+    return []
 
 
 def model_tag(checkpoint: dict, path: Path) -> str:
@@ -835,18 +848,6 @@ def plot_depth_rollouts(
             fontsize=8.5,
         )
 
-        if model_index > 0:
-            separator_y = axes[target_row, 0].get_position().y1
-            fig.add_artist(
-                plt.Line2D(
-                    [0.08, 0.93],
-                    [separator_y + 0.012, separator_y + 0.012],
-                    transform=fig.transFigure,
-                    color="#d0d0d0",
-                    linewidth=0.8,
-                )
-            )
-
     fig.suptitle(
         "Depth decoded from autoregressively predicted V-JEPA latents",
         x=0.08,
@@ -861,6 +862,40 @@ def plot_depth_rollouts(
         wspace=0.025,
         hspace=0.08,
     )
+
+    # The separators between model blocks are drawn only now, after
+    # subplots_adjust has fixed the layout (drawing them earlier would pin
+    # them to stale axis positions): measured from the rendered artists,
+    # each line sits midway between the lower model's column titles and the
+    # upper model's letterboxed image panels.
+    if len(examples) > 1:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        to_figure = fig.transFigure.inverted()
+        for model_index in range(1, len(examples)):
+            target_row = 2 * model_index
+            title_top = max(
+                to_figure.transform(
+                    (0, axes[target_row, step].title.get_window_extent(renderer).y1)
+                )[1]
+                for step in range(steps)
+            )
+            image_bottom = min(
+                to_figure.transform(
+                    (0, axes[target_row - 1, step].images[0].get_window_extent(renderer).y0)
+                )[1]
+                for step in range(steps)
+            )
+            separator_y = (title_top + image_bottom) / 2
+            fig.add_artist(
+                plt.Line2D(
+                    [0.08, 0.93],
+                    [separator_y, separator_y],
+                    transform=fig.transFigure,
+                    color="#d0d0d0",
+                    linewidth=0.8,
+                )
+            )
 
     if last_image is not None:
         colour_axis = fig.add_axes([0.925, 0.085, 0.016, 0.78])
@@ -1130,11 +1165,11 @@ def print_overview(tag: str, result: dict[str, Any]) -> None:
     for index, horizon in enumerate(result["horizon_seconds"]):
         print(
             f"{_horizon_label(horizon):<10} "
-            f"{latent['autoregressive_l1'][index]:>9.4f} "
-            f"{latent['copy_last_l1'][index]:>9.4f} "
-            f"{latent['zero_action_l1'][index]:>9.4f} "
-            f"{latent['zero_minus_real_l1'][index]:>10.4f} "
-            f"{latent['action_sensitivity_l1'][index]:>12.4f}"
+            f"{fmt(latent['autoregressive_l1'][index]):>9} "
+            f"{fmt(latent['copy_last_l1'][index]):>9} "
+            f"{fmt(latent['zero_action_l1'][index]):>9} "
+            f"{fmt(latent['zero_minus_real_l1'][index]):>10} "
+            f"{fmt(latent['action_sensitivity_l1'][index]):>12}"
         )
 
     if decoded:
@@ -1143,8 +1178,8 @@ def print_overview(tag: str, result: dict[str, Any]) -> None:
         for index, horizon in enumerate(result["horizon_seconds"]):
             print(
                 f"{_horizon_label(horizon):<10} "
-                f"{decoded['depth_non_sky_absrel'][index]:>10.4f} "
-                f"{decoded['semantics_planning_group_miou'][index]:>16.4f}"
+                f"{fmt(decoded['depth_non_sky_absrel'][index]):>10} "
+                f"{fmt(decoded['semantics_planning_group_miou'][index]):>16}"
             )
 
 
@@ -1343,6 +1378,15 @@ def main() -> None:
         type=Path,
         default=FIGURES_DIR,
     )
+    parser.add_argument(
+        "--replot",
+        action="store_true",
+        help=(
+            "skip evaluation: rebuild summary.md and the combined metrics.json "
+            "from the per-model <figures-dir>/<tag>/metrics.json files of an "
+            "earlier run (tables only; the qualitative figures need a real run)"
+        ),
+    )
     args = parser.parse_args()
 
     if args.rollout_steps <= 0:
@@ -1352,10 +1396,42 @@ def main() -> None:
     if args.batch_size <= 0:
         raise SystemExit("--batch-size must be positive")
 
+    if args.replot:
+        results = {
+            path.parent.name: json.loads(path.read_text())
+            for path in sorted(args.figures_dir.glob("*/metrics.json"))
+        }
+        # Skip metrics.json files written by the previous evaluator's schema.
+        results = {
+            tag: result
+            for tag, result in results.items()
+            if "autoregressive_l1" in result.get("latent", {})
+        }
+        if not results:
+            raise SystemExit(
+                f"no compatible <tag>/metrics.json under {args.figures_dir} to replot"
+            )
+        print("replotting from: " + ", ".join(results))
+        for tag, result in results.items():
+            print_overview(tag, result)
+        args.figures_dir.mkdir(parents=True, exist_ok=True)
+        write_metrics_json(
+            {
+                "evaluation": "focused action-conditioned latent predictor",
+                "models": results,
+            },
+            args.figures_dir / "metrics.json",
+        )
+        (args.figures_dir / "summary.md").write_text(summary_markdown(results))
+        print(f"combined metrics:   {args.figures_dir / 'metrics.json'}")
+        print(f"thesis tables:      {args.figures_dir / 'summary.md'}")
+        return
+
     checkpoint_paths = args.checkpoints or default_checkpoints()
     if not checkpoint_paths:
         raise SystemExit(
-            f"no world-model checkpoints found in {WM_CHECKPOINT_DIR}"
+            "no world-model checkpoints found in "
+            f"{WM_CHECKPOINT_DIR} or {AC_CHECKPOINT_DIR}"
         )
     missing = [path for path in checkpoint_paths if not path.exists()]
     if missing:
