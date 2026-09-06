@@ -9,8 +9,9 @@ checkpoint it reports three things:
    - copy-last persistence L1
 
 2. Decoded task performance
-   - non-sky depth AbsRel from the predicted latent
-   - planning-group semantic mIoU from the predicted latent
+   - non-sky depth AbsRel and planning-group semantic mIoU from the
+     predicted latent, next to the same metrics from the cached target
+     latent (the frozen decoders' ceiling on the very same frames)
 
 3. Action sensitivity
    - real-action rollout L1
@@ -34,13 +35,20 @@ Default outputs in OUTPUTS_DIR/evals_wm:
     <tag>/metrics.json
         Machine-readable results for one checkpoint.
 
-    depth_rollout.png
+    depth_rollout_<tag>.png
         FoundationStereo pseudo-depth versus depth decoded from predicted
-        latents over four horizons.
+        latents over four horizons, one figure per timestep model.
 
-    semantics_rollout.png
-        OneFormer planning groups versus planning groups decoded from predicted
-        latents over four horizons.
+    semantics_rollout_<tag>.png
+        OneFormer fine 19-class semantics versus the predicted-latent
+        decode, one figure per timestep model.
+
+    planning_semantics_rollout_<tag>.png
+        The same comparison rendered as the coarse planning groups.
+
+    decoded_metrics_vs_horizon_<tag>.png
+        Non-sky AbsRel and planning-group mIoU against horizon for the
+        predicted latent next to the cached target latent.
 
 The qualitative figures use one deterministic test window shared by every
 evaluated timestep model where possible. The default is the temporal midpoint
@@ -82,18 +90,26 @@ from jepa_drive_wm.evals.common import (
     SERIES,
     WM_CHECKPOINT_DIR,
     describe_checkpoint,
+    finish_figure,
     fmt,
     load_depth_decoder,
     load_semantic_decoder,
     load_world_model,
     markdown_table,
+    new_figure,
+    shared_legend_below,
+    style_axes,
     write_metrics_json,
 )
 from jepa_drive_wm.evals.depth_evaluator import (
     DepthMetricAccumulator,
     SKY_IGNORE_LUT,
 )
-from jepa_drive_wm.evals.semantics_evaluator import SemanticMetricAccumulator
+from jepa_drive_wm.evals.semantics_evaluator import (
+    SemanticMetricAccumulator,
+    _fine_colour_image,
+    _fine_legend_handles,
+)
 from jepa_drive_wm.models.dense_decoders.depth_decoder import DepthDecoder
 from jepa_drive_wm.models.dense_decoders.semantic_decoder import SemanticDecoder
 from jepa_drive_wm.models.predictors.ac_style.ac_predictor import VJEPA21WorldModel
@@ -559,16 +575,26 @@ def evaluate_decoded(
     max_windows: int | None,
 ) -> dict[str, Any]:
     """
-    Decode only the autoregressively predicted latents.
+    Decode the autoregressively predicted latents next to the cached target
+    latents.
 
-    Each horizon has an independent depth and semantic accumulator, so the
-    reported metrics are pixel-pooled over all selected target frames at that
-    horizon.
+    The cached target latent is the frozen V-JEPA encoding of the actual
+    future frame, so its decoded metrics are the frozen decoders' ceiling on
+    exactly the frames the world model is scored on. Each horizon and source
+    has an independent depth and semantic accumulator, so the reported
+    metrics are pixel-pooled over all selected target frames at that horizon.
     """
     model.eval()
     height, width = model.grid_height, model.grid_width
-    depth_accumulators = [DepthMetricAccumulator() for _ in range(steps)]
-    semantic_accumulators = [SemanticMetricAccumulator() for _ in range(steps)]
+    sources = ("predicted", "true")
+    depth_accumulators = {
+        source: [DepthMetricAccumulator() for _ in range(steps)]
+        for source in sources
+    }
+    semantic_accumulators = {
+        source: [SemanticMetricAccumulator() for _ in range(steps)]
+        for source in sources
+    }
 
     items = _anchor_items(dataset, every)
     if max_windows is not None:
@@ -594,45 +620,61 @@ def evaluate_decoded(
             frame = _future_frame(dataset, start_index, step)
             target_depth = sequence.get_depth(frame)
             target_semantics = sequence.get_semantics(frame)
-            latent = predictions[step].permute(2, 0, 1)[None]
+            latents = {
+                "predicted": predictions[step].permute(2, 0, 1)[None],
+                "true": sample["future_latents"][step]
+                .view(height, width, -1)
+                .permute(2, 0, 1)[None]
+                .to(DEVICE),
+            }
 
-            decoded_depth, decoded_semantics = _decode(
-                depth_decoder,
-                semantic_decoder,
-                latent,
-                target_depth.shape,
-                target_semantics.shape,
-            )
-            depth_accumulators[step].update(
-                target_depth,
-                decoded_depth,
-                target_semantics,
-            )
-            semantic_accumulators[step].update(
-                target_semantics,
-                decoded_semantics,
-            )
+            for source, latent in latents.items():
+                decoded_depth, decoded_semantics = _decode(
+                    depth_decoder,
+                    semantic_decoder,
+                    latent,
+                    target_depth.shape,
+                    target_semantics.shape,
+                )
+                depth_accumulators[source][step].update(
+                    target_depth,
+                    decoded_depth,
+                    target_semantics,
+                )
+                semantic_accumulators[source][step].update(
+                    target_semantics,
+                    decoded_semantics,
+                )
 
         if number % 25 == 0 or number == len(items):
             print(f"  decoded {number}/{len(items)} windows", flush=True)
 
-    depth_absrel = [
-        float(accumulator.summary()["non-sky"]["absrel"])
-        for accumulator in depth_accumulators
-    ]
-    planning_miou = [
-        float(accumulator.summary()["planning_group_miou"])
-        for accumulator in semantic_accumulators
-    ]
+    depth_absrel = {
+        source: [
+            float(accumulator.summary()["non-sky"]["absrel"])
+            for accumulator in accumulators
+        ]
+        for source, accumulators in depth_accumulators.items()
+    }
+    planning_miou = {
+        source: [
+            float(accumulator.summary()["planning_group_miou"])
+            for accumulator in accumulators
+        ]
+        for source, accumulators in semantic_accumulators.items()
+    }
 
     return {
         "windows": len(items),
         "every": every,
         "aggregation": (
-            "one pixel-pooled accumulator per horizon over fixed-grid anchor windows"
+            "one pixel-pooled accumulator per horizon and latent source "
+            "over fixed-grid anchor windows"
         ),
-        "depth_non_sky_absrel": depth_absrel,
-        "semantics_planning_group_miou": planning_miou,
+        "depth_non_sky_absrel": depth_absrel["predicted"],
+        "semantics_planning_group_miou": planning_miou["predicted"],
+        "depth_non_sky_absrel_true": depth_absrel["true"],
+        "semantics_planning_group_miou_true": planning_miou["true"],
     }
 
 
@@ -767,20 +809,13 @@ def collect_qualitative_example(
     }
 
 
-def plot_depth_rollouts(
-    examples: list[dict[str, Any]],
-    path: Path,
-) -> Path:
-    """Two rows per model: FoundationStereo and predicted-latent depth."""
-    if not examples:
-        raise ValueError("no qualitative examples supplied")
-
-    steps = len(examples[0]["horizons"])
-    rows = 2 * len(examples)
+def plot_depth_rollout(example: dict[str, Any], path: Path) -> Path:
+    """One model, two rows: FoundationStereo vs predicted-latent depth."""
+    steps = len(example["horizons"])
     fig, axes = plt.subplots(
-        rows,
+        2,
         steps,
-        figsize=(3.15 * steps + 0.6, 1.78 * rows + 0.65),
+        figsize=(3.15 * steps + 0.6, 4.35),
         squeeze=False,
     )
 
@@ -789,116 +824,64 @@ def plot_depth_rollouts(
     normalisation = LogNorm(vmin=MIN_DEPTH, vmax=MAX_DEPTH)
     last_image = None
 
-    for model_index, example in enumerate(examples):
-        target_row = 2 * model_index
-        prediction_row = target_row + 1
+    for step in range(steps):
+        mask = example["depth_masks"][step]
+        target = np.ma.masked_where(~mask, example["target_depths"][step])
+        prediction = np.ma.masked_where(~mask, example["predicted_depths"][step])
 
-        for step in range(steps):
-            mask = example["depth_masks"][step]
-            target = np.ma.masked_where(
-                ~mask,
-                example["target_depths"][step],
-            )
-            prediction = np.ma.masked_where(
-                ~mask,
-                example["predicted_depths"][step],
-            )
-
-            axes[target_row, step].imshow(
-                target,
-                cmap=colour_map,
-                norm=normalisation,
-            )
-            last_image = axes[prediction_row, step].imshow(
-                prediction,
-                cmap=colour_map,
-                norm=normalisation,
-            )
-
-            axes[target_row, step].set_title(
-                f"$t+{example['horizons'][step]:.1f}\\,\\mathrm{{s}}$",
-                pad=6,
-            )
-
-            for row in (target_row, prediction_row):
-                axis = axes[row, step]
-                axis.set_xticks([])
-                axis.set_yticks([])
-                for spine in axis.spines.values():
-                    spine.set_visible(False)
-
-        model_label = (
-            f"{example['step_seconds']:g} s-step model\n"
-            f"seq. {example['sequence']:02d}, anchor {example['anchor_frame']}"
+        axes[0, step].imshow(target, cmap=colour_map, norm=normalisation)
+        last_image = axes[1, step].imshow(
+            prediction,
+            cmap=colour_map,
+            norm=normalisation,
         )
-        axes[target_row, 0].set_ylabel(
-            model_label + "\nFoundationStereo",
-            rotation=0,
-            ha="right",
-            va="center",
-            labelpad=16,
-            fontsize=8.5,
+        axes[0, step].set_title(
+            f"$t+{example['horizons'][step]:.1f}\\,\\mathrm{{s}}$",
+            pad=6,
         )
-        axes[prediction_row, 0].set_ylabel(
-            "Predicted-latent\ndecode",
-            rotation=0,
-            ha="right",
-            va="center",
-            labelpad=16,
-            fontsize=8.5,
-        )
+        for row in (0, 1):
+            axis = axes[row, step]
+            axis.set_xticks([])
+            axis.set_yticks([])
+            for spine in axis.spines.values():
+                spine.set_visible(False)
+
+    axes[0, 0].set_ylabel(
+        "FoundationStereo",
+        rotation=0,
+        ha="right",
+        va="center",
+        labelpad=16,
+        fontsize=8.5,
+    )
+    axes[1, 0].set_ylabel(
+        "Predicted-latent\ndecode",
+        rotation=0,
+        ha="right",
+        va="center",
+        labelpad=16,
+        fontsize=8.5,
+    )
 
     fig.suptitle(
-        "Depth decoded from autoregressively predicted V-JEPA latents",
+        "Depth decoded from predicted V-JEPA latents -- "
+        f"{example['step_seconds']:g} s-step model, "
+        f"seq. {example['sequence']:02d}, anchor {example['anchor_frame']}",
         x=0.08,
         ha="left",
         fontsize=11,
     )
     fig.subplots_adjust(
-        left=0.17,
+        left=0.14,
         right=0.91,
-        top=0.92,
+        top=0.86,
         bottom=0.06,
         wspace=0.025,
         hspace=0.08,
     )
 
-    # The separators between model blocks are drawn only now, after
-    # subplots_adjust has fixed the layout (drawing them earlier would pin
-    # them to stale axis positions): measured from the rendered artists,
-    # each line sits midway between the lower model's column titles and the
-    # upper model's letterboxed image panels.
-    if len(examples) > 1:
-        fig.canvas.draw()
-        renderer = fig.canvas.get_renderer()
-        to_figure = fig.transFigure.inverted()
-        for model_index in range(1, len(examples)):
-            target_row = 2 * model_index
-            title_top = max(
-                to_figure.transform(
-                    (0, axes[target_row, step].title.get_window_extent(renderer).y1)
-                )[1]
-                for step in range(steps)
-            )
-            image_bottom = min(
-                to_figure.transform(
-                    (0, axes[target_row - 1, step].images[0].get_window_extent(renderer).y0)
-                )[1]
-                for step in range(steps)
-            )
-            separator_y = (title_top + image_bottom) / 2
-            fig.add_artist(
-                plt.Line2D(
-                    [0.08, 0.93],
-                    [separator_y, separator_y],
-                    transform=fig.transFigure,
-                    color="#d0d0d0",
-                    linewidth=0.8,
-                )
-            )
-
     if last_image is not None:
-        colour_axis = fig.add_axes([0.925, 0.085, 0.016, 0.78])
+        colour_axis = fig.add_axes([0.925, 0.10, 0.016, 0.72])
         colour_bar = fig.colorbar(last_image, cax=colour_axis)
         colour_bar.set_label("Depth (m, logarithmic scale)", fontsize=8.5)
         colour_bar.set_ticks([1, 2, 5, 10, 20, 40, 80])
@@ -910,73 +893,68 @@ def plot_depth_rollouts(
     return path
 
 
-def plot_semantic_rollouts(
-    examples: list[dict[str, Any]],
+def plot_semantic_rollout(
+    example: dict[str, Any],
     path: Path,
+    *,
+    planning: bool,
 ) -> Path:
-    """Two rows per model: OneFormer and predicted-latent planning groups."""
-    if not examples:
-        raise ValueError("no qualitative examples supplied")
+    """
+    One model, two rows: OneFormer pseudo-labels vs predicted-latent decode.
 
-    steps = len(examples[0]["horizons"])
-    rows = 2 * len(examples)
+    ``planning=True`` renders the coarse planning groups; ``planning=False``
+    the full 19 Cityscapes classes (OneFormer-unlabelled pixels in grey).
+    Both rows use the identical class-colour mapping.
+    """
+    steps = len(example["horizons"])
+    colourise = _planning_colour_image if planning else _fine_colour_image
+    handles = _planning_legend_handles() if planning else _fine_legend_handles()
+    legend_columns = min(5, len(handles)) if planning else 7
+    legend_rows = max(1, math.ceil(len(handles) / legend_columns))
+
     fig, axes = plt.subplots(
-        rows,
+        2,
         steps,
-        figsize=(3.15 * steps + 0.6, 1.78 * rows + 0.95),
+        figsize=(3.15 * steps + 0.6, 4.2 + 0.32 * legend_rows),
         squeeze=False,
     )
 
-    for model_index, example in enumerate(examples):
-        target_row = 2 * model_index
-        prediction_row = target_row + 1
-
-        for step in range(steps):
-            axes[target_row, step].imshow(
-                _planning_colour_image(example["target_semantics"][step])
-            )
-            axes[prediction_row, step].imshow(
-                _planning_colour_image(example["predicted_semantics"][step])
-            )
-            axes[target_row, step].set_title(
-                f"$t+{example['horizons'][step]:.1f}\\,\\mathrm{{s}}$",
-                pad=6,
-            )
-
-            for row in (target_row, prediction_row):
-                axis = axes[row, step]
-                axis.set_xticks([])
-                axis.set_yticks([])
-                for spine in axis.spines.values():
-                    spine.set_visible(False)
-
-        model_label = (
-            f"{example['step_seconds']:g} s-step model\n"
-            f"seq. {example['sequence']:02d}, anchor {example['anchor_frame']}"
+    for step in range(steps):
+        axes[0, step].imshow(colourise(example["target_semantics"][step]))
+        axes[1, step].imshow(colourise(example["predicted_semantics"][step]))
+        axes[0, step].set_title(
+            f"$t+{example['horizons'][step]:.1f}\\,\\mathrm{{s}}$",
+            pad=6,
         )
-        axes[target_row, 0].set_ylabel(
-            model_label + "\nOneFormer",
-            rotation=0,
-            ha="right",
-            va="center",
-            labelpad=16,
-            fontsize=8.5,
-        )
-        axes[prediction_row, 0].set_ylabel(
-            "Predicted-latent\ndecode",
-            rotation=0,
-            ha="right",
-            va="center",
-            labelpad=16,
-            fontsize=8.5,
-        )
+        for row in (0, 1):
+            axis = axes[row, step]
+            axis.set_xticks([])
+            axis.set_yticks([])
+            for spine in axis.spines.values():
+                spine.set_visible(False)
 
-    handles = _planning_legend_handles()
-    legend_rows = max(1, math.ceil(len(handles) / 5))
-    bottom = 0.07 + 0.035 * legend_rows
+    axes[0, 0].set_ylabel(
+        "OneFormer",
+        rotation=0,
+        ha="right",
+        va="center",
+        labelpad=16,
+        fontsize=8.5,
+    )
+    axes[1, 0].set_ylabel(
+        "Predicted-latent\ndecode",
+        rotation=0,
+        ha="right",
+        va="center",
+        labelpad=16,
+        fontsize=8.5,
+    )
 
+    kind = "Planning groups" if planning else "Fine-class semantics"
     fig.suptitle(
-        "Planning groups decoded from autoregressively predicted V-JEPA latents",
+        f"{kind} decoded from predicted V-JEPA latents -- "
+        f"{example['step_seconds']:g} s-step model, "
+        f"seq. {example['sequence']:02d}, anchor {example['anchor_frame']}",
         x=0.08,
         ha="left",
         fontsize=11,
@@ -984,17 +962,18 @@ def plot_semantic_rollouts(
     fig.legend(
         handles=handles,
         loc="lower center",
-        ncol=min(5, len(handles)),
+        ncol=legend_columns,
         frameon=False,
-        columnspacing=1.3,
-        handlelength=1.4,
+        columnspacing=1.1,
+        handlelength=1.3,
+        handletextpad=0.4,
         bbox_to_anchor=(0.55, 0.01),
     )
     fig.subplots_adjust(
-        left=0.17,
+        left=0.14,
         right=0.995,
-        top=0.92,
-        bottom=bottom,
+        top=0.85,
+        bottom=0.06 + 0.055 * legend_rows,
         wspace=0.025,
         hspace=0.08,
     )
@@ -1002,6 +981,66 @@ def plot_semantic_rollouts(
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
+    return path
+
+
+def plot_decoded_curves(
+    tag: str,
+    result: dict[str, Any],
+    path: Path,
+) -> Path:
+    """One model: decoded metric vs horizon, predicted vs cached latent."""
+    decoded = result["decoded"]
+    horizons = np.asarray(result["horizon_seconds"])
+    series_style = {
+        "predicted latent": dict(
+            color=SERIES[0], linestyle="-", marker="o", markersize=4
+        ),
+        "cached target latent": dict(
+            color=SERIES[1], linestyle="--", marker="s", markersize=3.5
+        ),
+    }
+    panels = [
+        (
+            "Non-sky depth AbsRel (lower is better)",
+            "AbsRel",
+            {
+                "predicted latent": decoded["depth_non_sky_absrel"],
+                "cached target latent": decoded.get("depth_non_sky_absrel_true"),
+            },
+        ),
+        (
+            "Planning-group mIoU (higher is better)",
+            "mIoU",
+            {
+                "predicted latent": decoded["semantics_planning_group_miou"],
+                "cached target latent": decoded.get(
+                    "semantics_planning_group_miou_true"
+                ),
+            },
+        ),
+    ]
+
+    fig, axes = new_figure(ncols=2, width=4.6, height=3.6)
+    for ax, (title, ylabel, data) in zip(axes[0], panels):
+        for label, values in data.items():
+            if values is None:
+                continue
+            ax.plot(
+                horizons,
+                values,
+                linewidth=1.8,
+                label=label,
+                **series_style[label],
+            )
+        style_axes(
+            ax,
+            title=f"{title}\n({tag} model)",
+            xlabel="horizon (s)",
+            ylabel=ylabel,
+        )
+    bottom = shared_legend_below(fig, axes[0, 0], ncol=2)
+    finish_figure(fig, path, rect=(0, bottom, 1, 1))
     return path
 
 
@@ -1063,6 +1102,8 @@ def summary_markdown(results: dict[str, dict[str, Any]]) -> str:
 
         decoded = result.get("decoded")
         if decoded is not None:
+            absrel_true = decoded.get("depth_non_sky_absrel_true")
+            miou_true = decoded.get("semantics_planning_group_miou_true")
             lines.extend(
                 [
                     "### Decoded performance: depth",
@@ -1070,11 +1111,13 @@ def summary_markdown(results: dict[str, dict[str, Any]]) -> str:
                     markdown_table(
                         [
                             "Prediction horizon",
+                            "Cached-latent non-sky AbsRel ↓",
                             "Predicted-latent non-sky AbsRel ↓",
                         ],
                         [
                             [
                                 _horizon_label(horizon),
+                                absrel_true[index] if absrel_true else None,
                                 decoded["depth_non_sky_absrel"][index],
                             ]
                             for index, horizon in enumerate(horizons)
@@ -1086,11 +1129,13 @@ def summary_markdown(results: dict[str, dict[str, Any]]) -> str:
                     markdown_table(
                         [
                             "Prediction horizon",
+                            "Cached-latent planning-group mIoU ↑",
                             "Predicted-latent planning-group mIoU ↑",
                         ],
                         [
                             [
                                 _horizon_label(horizon),
+                                miou_true[index] if miou_true else None,
                                 decoded["semantics_planning_group_miou"][index],
                             ]
                             for index, horizon in enumerate(horizons)
@@ -1099,7 +1144,12 @@ def summary_markdown(results: dict[str, dict[str, Any]]) -> str:
                     "",
                     f"Decoded metrics use {decoded['windows']} fixed-grid test "
                     f"windows (every {decoded['every']} raw frames) and are "
-                    "pooled over pixels separately at each horizon.",
+                    "pooled over pixels separately at each horizon. "
+                    "Cached-latent columns decode the frozen V-JEPA encoding "
+                    "of the actual target frame -- the frozen decoders' "
+                    "ceiling on exactly these frames; predicted-latent "
+                    "columns decode the world model's autoregressive "
+                    "prediction of that frame.",
                     "",
                 ]
             )
@@ -1173,13 +1223,20 @@ def print_overview(tag: str, result: dict[str, Any]) -> None:
         )
 
     if decoded:
-        print("\nDecoded predicted-latent metrics")
-        print(f"{'horizon':<10} {'AbsRel':>10} {'planning mIoU':>16}")
+        absrel_true = decoded.get("depth_non_sky_absrel_true")
+        miou_true = decoded.get("semantics_planning_group_miou_true")
+        print("\nDecoded metrics (cached target latent vs predicted latent)")
+        print(
+            f"{'horizon':<10} {'AbsRel cached':>14} {'AbsRel pred':>12} "
+            f"{'mIoU cached':>12} {'mIoU pred':>10}"
+        )
         for index, horizon in enumerate(result["horizon_seconds"]):
             print(
                 f"{_horizon_label(horizon):<10} "
-                f"{fmt(decoded['depth_non_sky_absrel'][index]):>10} "
-                f"{fmt(decoded['semantics_planning_group_miou'][index]):>16}"
+                f"{fmt(absrel_true[index] if absrel_true else None):>14} "
+                f"{fmt(decoded['depth_non_sky_absrel'][index]):>12} "
+                f"{fmt(miou_true[index] if miou_true else None):>12} "
+                f"{fmt(decoded['semantics_planning_group_miou'][index]):>10}"
             )
 
 
@@ -1382,9 +1439,10 @@ def main() -> None:
         "--replot",
         action="store_true",
         help=(
-            "skip evaluation: rebuild summary.md and the combined metrics.json "
-            "from the per-model <figures-dir>/<tag>/metrics.json files of an "
-            "earlier run (tables only; the qualitative figures need a real run)"
+            "skip evaluation: rebuild summary.md, the combined metrics.json "
+            "and the decoded-metric curves from the per-model "
+            "<figures-dir>/<tag>/metrics.json files of an earlier run "
+            "(the qualitative rollout figures need a real run)"
         ),
     )
     args = parser.parse_args()
@@ -1423,6 +1481,13 @@ def main() -> None:
             args.figures_dir / "metrics.json",
         )
         (args.figures_dir / "summary.md").write_text(summary_markdown(results))
+        for tag, result in results.items():
+            if result.get("decoded"):
+                plot_decoded_curves(
+                    tag,
+                    result,
+                    args.figures_dir / f"decoded_metrics_vs_horizon_{tag}.png",
+                )
         print(f"combined metrics:   {args.figures_dir / 'metrics.json'}")
         print(f"thesis tables:      {args.figures_dir / 'summary.md'}")
         return
@@ -1494,17 +1559,35 @@ def main() -> None:
         summary_markdown(results)
     )
 
-    if qualitative_examples:
-        depth_path = plot_depth_rollouts(
-            qualitative_examples,
-            args.figures_dir / "depth_rollout.png",
+    print()
+    for example in qualitative_examples:
+        tag = example["tag"]
+        depth_path = plot_depth_rollout(
+            example,
+            args.figures_dir / f"depth_rollout_{tag}.png",
         )
-        semantics_path = plot_semantic_rollouts(
-            qualitative_examples,
-            args.figures_dir / "semantics_rollout.png",
+        fine_path = plot_semantic_rollout(
+            example,
+            args.figures_dir / f"semantics_rollout_{tag}.png",
+            planning=False,
         )
-        print(f"\ndepth figure:       {depth_path}")
-        print(f"semantics figure:   {semantics_path}")
+        planning_path = plot_semantic_rollout(
+            example,
+            args.figures_dir / f"planning_semantics_rollout_{tag}.png",
+            planning=True,
+        )
+        print(f"[{tag}] depth figure:              {depth_path}")
+        print(f"[{tag}] fine semantics figure:     {fine_path}")
+        print(f"[{tag}] planning semantics figure: {planning_path}")
+
+    for tag, result in results.items():
+        if result.get("decoded"):
+            curves_path = plot_decoded_curves(
+                tag,
+                result,
+                args.figures_dir / f"decoded_metrics_vs_horizon_{tag}.png",
+            )
+            print(f"[{tag}] decoded curves:            {curves_path}")
 
     print(f"combined metrics:   {args.figures_dir / 'metrics.json'}")
     print(f"thesis tables:      {args.figures_dir / 'summary.md'}")
