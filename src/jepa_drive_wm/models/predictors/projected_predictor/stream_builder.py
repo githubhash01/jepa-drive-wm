@@ -113,8 +113,6 @@ class VideoStreamBuilder:
     TUBELET_SIZE = 2
 
     def __init__(self, warp_module: Any):
-        # ``Any`` is deliberate: keeping this utility duck-typed avoids pulling
-        # PyTorch3D into modules/tests that only exercise stream assembly.
         self.warp_module = warp_module
 
     def build(
@@ -169,9 +167,6 @@ class VideoStreamBuilder:
         warp_rgbs = [self._warp_rgb(w) for w in raw_warps]
         warp_valid = [self._warp_patch_valid(w) for w in raw_warps]
 
-        # WarpModule renders on the device/dtype of its registered intrinsics.
-        # Move observed frames to that same representation before stacking the
-        # video streams (e.g. CPU DataLoader tensors + GPU warper).
         stream_device = warp_rgbs[0].device
         stream_dtype = warp_rgbs[0].dtype
         context = [

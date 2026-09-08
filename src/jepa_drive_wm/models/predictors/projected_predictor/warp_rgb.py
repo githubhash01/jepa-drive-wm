@@ -29,16 +29,6 @@ from pytorch3d.renderer.cameras import get_screen_to_ndc_transform
 from pytorch3d.structures import Pointclouds
 from pytorch3d.utils import cameras_from_opencv_projection
 
-
-# Canonical geometry defaults, shared by every consumer (WarpModule itself,
-# the trainer CLI, quick_check).  Override per-call/CLI only for experiments.
-#
-# Threshold rationale (seq-9 sweep, 2026-08-20): S = 1[Q >= tau] is a much
-# better trust signal at higher tau -- a "valid" patch still carries up to
-# (1 - tau) unoccupied black pixels inside its own 16x16 token, corrupting it
-# before any attention.  At 0.7 the warp latent barely beat copy-forward on
-# valid patches; 0.8 quadrupled that margin while keeping ~57%/23% coverage at
-# the near/far horizons (0.9 starved the far horizon to 14%).
 DEFAULT_RADIUS_PX = 1.0
 DEFAULT_PATCH_COVERAGE_THRESHOLD = 0.8
 
